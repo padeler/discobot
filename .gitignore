@@ -1,0 +1,14 @@
+# Sensitive files
+config.toml
+history.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pyenv/
+
+# Environment
+.env
+pyenv
+bot.log
