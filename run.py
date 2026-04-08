@@ -1,17 +1,30 @@
 import json
 import logging
+import os
 import discord
 from discord import app_commands
 import toml
 import aiohttp
 import re
 import asyncio
+from datetime import datetime, timedelta
 from discord.ext import tasks
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()  # Load environment variables from .env file if it exists
+
+TOKEN = os.getenv(
+    "DISCORD_TOKEN", None
+)  # Ensure the token is loaded into the environment
+
+if not TOKEN:
+    raise EnvironmentError(
+        "DISCORD_TOKEN environment variable not set. Please set it in your environment or in config.toml"
+    )
 
 # Configuration
 config = toml.load("config.toml")
-TOKEN = config['discord']['token']
 MODEL = config['ollama']['model']
 TEMPERATURE = config['ollama'].get('temperature', 0.7)
 TOP_P = config['ollama'].get('top_p', 0.9)
@@ -24,6 +37,12 @@ HISTORY_DIR.mkdir(parents=True, exist_ok=True)
 # History settings
 HISTORY_MAX_MESSAGES = config.get('history', {}).get('max_messages', 40)
 HISTORY_CLEANUP_ENABLED = config.get('history', {}).get('cleanup_enabled', True)
+
+# Conversation tracking settings
+CONVERSATION_WINDOW_MINUTES = config.get("conversation", {}).get("window_minutes", 5)
+CONVERSATION_MAX_USERS_TRACKED = config.get("conversation", {}).get(
+    "max_users_tracked", 50
+)
 
 # Channel response settings
 CHANNEL_RESPONSE_ENABLED = config.get('channel', {}).get('enabled', True)
@@ -57,16 +76,59 @@ logging.basicConfig(
 logger = logging.getLogger('DiscordBot')
 
 def load_history(guild_id, channel_id):
+    """Load conversation history with timestamps and usernames."""
     file_path = HISTORY_DIR / f"{guild_id}_{channel_id}.json"
     if file_path.exists():
-        with open(file_path, 'r', encoding='utf-8') as f:
-            try:
-                history = json.load(f)
-            except json.JSONDecodeError:
-                logger.error(f"History file {file_path} is corrupted. Starting with an empty history.")
-                return []
-            logger.debug(f"Loaded {len(history)} messages from {file_path}")
-            return history
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+                if not content.strip():
+                    logger.warning(
+                        f"History file {file_path} is empty. Starting with an empty history."
+                    )
+                    return []
+                history = json.loads(content)
+                if not isinstance(history, list):
+                    logger.error(
+                        f"History file {file_path} contains invalid format. Starting fresh."
+                    )
+                    return []
+                # Migrate old format entries (without timestamp/author) to new format
+                migrated = False
+                for i, msg in enumerate(history):
+                    if not isinstance(msg, dict):
+                        history[i] = {
+                            "role": "unknown",
+                            "content": str(msg),
+                            "timestamp": datetime.now().isoformat(),
+                            "author": None,
+                        }
+                        migrated = True
+                    elif "timestamp" not in msg:
+                        # Old format - add current timestamp and extract author from content
+                        author = None
+                        if msg.get("role") == "user" and msg.get(
+                            "content", ""
+                        ).startswith("["):
+                            match = re.match(r"\[([^]]+)\]:", msg["content"])
+                            if match:
+                                author = match.group(1)
+                                msg["content"] = (
+                                    msg["content"].split("]: ", 1)[1]
+                                    if "]:" in msg["content"]
+                                    else msg["content"]
+                                )
+                        msg["timestamp"] = datetime.now().isoformat()
+                        msg["author"] = author
+                        migrated = True
+                if migrated:
+                    logger.info(f"Migrated history format for {guild_id}_{channel_id}")
+                    save_history(guild_id, channel_id, history)
+        except json.JSONDecodeError:
+            logger.error(f"History file {file_path} is corrupted. Starting fresh.")
+            return []
+        logger.debug(f"Loaded {len(history)} messages from {file_path}")
+        return history
     logger.debug(f"No existing history found for {guild_id}_{channel_id}, starting fresh")
     return []
 
@@ -90,25 +152,88 @@ def cleanup_history(history):
     logger.debug(f"Cleaned up history: removed {removed} messages, kept {len(history)}")
     return history
 
-def add_to_history(guild_id, channel_id, role, content):
-    """Helper to add a single message to history without generating a response."""
+
+def get_active_conversations(guild_id, channel_id):
+    """
+    Get list of users with active conversations in this channel.
+    A conversation is active if the user has exchanged messages with the bot
+    within the conversation window.
+
+    Returns: dict mapping username -> {last_activity: datetime, message_count: int}
+    """
     history = load_history(guild_id, channel_id)
-    history.append({"role": role, "content": content})
+    now = datetime.now()
+    window_start = now - timedelta(minutes=CONVERSATION_WINDOW_MINUTES)
+
+    active = {}
+    bot_in_conversation = False
+
+    for msg in history:
+        if not isinstance(msg, dict):
+            continue
+
+        # Parse timestamp
+        try:
+            ts_str = msg.get("timestamp", "")
+            if "." in ts_str:
+                ts = datetime.fromisoformat(ts_str)
+            else:
+                continue  # Skip entries without valid timestamp
+        except (ValueError, TypeError):
+            continue
+
+        # Skip messages outside the window
+        if ts < window_start:
+            continue
+
+        role = msg.get("role", "")
+        author = msg.get("author")
+
+        if role == "assistant":
+            bot_in_conversation = True
+        elif role == "user" and author:
+            if author not in active:
+                active[author] = {"last_activity": ts, "message_count": 0}
+            active[author]["last_activity"] = max(active[author]["last_activity"], ts)
+            active[author]["message_count"] += 1
+
+    # Only return users if bot was also active (actual conversations)
+    if bot_in_conversation:
+        # Limit to max users tracked
+        if len(active) > CONVERSATION_MAX_USERS_TRACKED:
+            # Keep users with most recent activity
+            sorted_users = sorted(
+                active.items(), key=lambda x: x[1]["last_activity"], reverse=True
+            )
+            active = dict(sorted_users[:CONVERSATION_MAX_USERS_TRACKED])
+        logger.debug(f"Active conversations in {channel_id}: {list(active.keys())}")
+        return active
+
+    return {}
+
+
+def add_to_history(guild_id, channel_id, role, content, author=None):
+    """Add a message to history with timestamp and author info.
+
+    Args:
+        guild_id: Server ID
+        channel_id: Channel ID
+        role: 'user' or 'assistant'
+        content: Message content
+        author: Author name (username for users, None for assistant)
+    """
+    history = load_history(guild_id, channel_id)
+    entry = {
+        "role": role,
+        "content": content,
+        "timestamp": datetime.now().isoformat(),
+        "author": author if role == "user" else "bot",
+    }
+    history.append(entry)
     history = cleanup_history(history)
     save_history(guild_id, channel_id, history)
+    return entry
 
-def get_bot_id():
-    """Get the bot's user ID for mention detection."""
-    return client.user.id if client.user else None
-
-def is_bot_mentioned(content):
-    """Check if the bot is mentioned in the message content."""
-    bot_id = get_bot_id()
-    if not bot_id:
-        return False
-    # Check for @mention format: <@userid> or <@!userid>
-    bot_mention_pattern = rf'<@!?{bot_id}>'
-    return bool(re.search(bot_mention_pattern, content))
 
 def build_messages_with_system(user_messages):
     """Prepend system prompt to messages if enabled."""
@@ -125,9 +250,13 @@ def get_context_summary_from_history(history):
     # Get the last few assistant responses to understand recent topics
     recent_topics = []
     for msg in reversed(history[-10:]):
-        if msg['role'] == 'assistant' and len(recent_topics) < 3:
+        if (
+            isinstance(msg, dict)
+            and msg.get("role") == "assistant"
+            and len(recent_topics) < 3
+        ):
             # Get first sentence or short summary
-            content = msg['content'][:200]
+            content = msg.get("content", "")[:200]
             if '.' in content:
                 content = content.split('.')[0] + '.'
             recent_topics.append(content)
@@ -156,7 +285,7 @@ class MyBot(discord.Client):
 
     @tasks.loop(seconds=LOOP_INTERVAL)
     async def process_messages_loop(self):
-        """Periodically process queued messages and generate responses."""
+        """Periodically process queued auto-response messages and generate responses."""
         try:
             async with self.queue_lock:
                 if not self.response_queue:
@@ -166,7 +295,9 @@ class MyBot(discord.Client):
                 current_batch = list(self.response_queue)
                 self.response_queue.clear()
 
-            logger.info(f"Processing batch of {len(current_batch)} messages")
+            logger.info(
+                f"Processing batch of {len(current_batch)} auto-response messages"
+            )
 
             # Group requests by channel
             channels_map = {}
@@ -183,39 +314,29 @@ class MyBot(discord.Client):
                     logger.warning(f"Could not find channel {channel_id}, skipping")
                     continue
 
-                # Evaluate the batch to decide the action
-                action, target_id = await evaluate_batch(channel.name, requests)
+                # Evaluate the batch to decide if we should respond
+                # Load history to provide conversation context
+                history = load_history(requests[0]["guild_id"], channel_id)
+                should_respond = await evaluate_auto_response_batch(
+                    channel.name, requests, history
+                )
 
-                if action == "SKIP":
+                if not should_respond:
                     logger.info(f"Batch evaluator decided to SKIP for #{channel.name}")
                     continue
 
-                # Determine the message to reply to
-                reply_to_msg = None
-                if action == "REPLY_MESSAGE":
-                    # Find the message object in the batch that matches the ID
-                    for req in requests:
-                        if str(req['message'].id) == target_id:
-                            reply_to_msg = req['message']
-                            break
-                    if not reply_to_msg:
-                        logger.warning(f"LLM requested reply to {target_id} but it wasn't in the batch. Replying to channel instead.")
-                        action = "REPLY_CHANNEL"
-
-                logger.info(f"Responding to #{channel.name} with action {action}")
+                logger.info(f"Responding to #{channel.name}")
 
                 try:
                     await channel.typing()
-                    # The prompt for the actual response asks the AI to address the conversation.
-                    # Since get_ollama_response uses the history file, it will see the whole batch.
-                    generation_prompt = "Please provide a response to the recent conversation in the channel."
+                    # Get response using conversation history
                     response = await get_ollama_response(
-                        generation_prompt,
-                        requests[0]['guild_id'],
-                        requests[0]['channel_id'],
-                        include_context=True
+                        "Please provide a response to the recent conversation in the channel.",
+                        requests[0]["guild_id"],
+                        requests[0]["channel_id"],
+                        include_context=True,
                     )
-                    await send_chunked_response(channel, response, reply_to=reply_to_msg)
+                    await send_chunked_response(channel, response)
                     logger.info(f"Response sent in #{channel.name}")
                 except Exception as e:
                     logger.error(f"Error in processing loop for channel {channel.name}: {e}")
@@ -232,64 +353,116 @@ class MyBot(discord.Client):
 client = MyBot(intents=intents)
 
 
-async def evaluate_batch(channel_name, requests):
+async def evaluate_auto_response_batch(channel_name, requests, history):
     """
-    Evaluate a batch of messages to decide if and how the bot should respond.
-    Returns (action, target_message_id)
+    Evaluate a batch of auto-response messages to decide if the bot should respond.
+    Returns True if should respond, False otherwise.
+    Note: This is for non-mention messages only - mentions are handled immediately.
+
+    Args:
+        channel_name: Name of the channel
+        requests: List of message requests in the batch
+        history: Conversation history for context (list of dicts with role/content/timestamp/author)
     """
+    # Build the new messages list with timestamps
     messages_list = []
-    has_mention = False
     for req in requests:
         msg = req['message']
-        messages_list.append(f"[{msg.author.display_name}]: {msg.content}")
-        if req.get('is_mention'):
-            has_mention = True
+        ts = msg.created_at.strftime("%H:%M")
+        messages_list.append(f"[{ts}] [{msg.author.display_name}]: {msg.content}")
 
     batch_content = "\n".join(messages_list)
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    eval_prompt = f"""You are a Discord conversation manager. Below are the messages received in channel #{channel_name} since the last response:
+    # Get active conversations
+    guild_id = requests[0]["guild_id"]
+    channel_id = requests[0]["channel_id"]
+    active_conversations = get_active_conversations(guild_id, channel_id)
 
+    # Check which users in the batch have active conversations
+    batch_users = set(req["message"].author.display_name for req in requests)
+    users_with_active_convos = batch_users & set(active_conversations.keys())
+
+    # Build context from recent history with timestamps
+    context_lines = []
+    for msg in history[-12:]:
+        if isinstance(msg, dict) and "role" in msg and "content" in msg:
+            role_label = (
+                "Bot" if msg["role"] == "assistant" else msg.get("author", "User")
+            )
+            ts_str = (
+                msg.get("timestamp", "")[:19] if msg.get("timestamp") else "???:??:??"
+            )
+            content = msg["content"][:120]
+            context_lines.append(f"[{ts_str}] {role_label}: {content}")
+    context_str = (
+        "\n".join(context_lines) if context_lines else "No recent conversation history."
+    )
+
+    active_users_str = (
+        ", ".join(f"@{u}" for u in users_with_active_convos)
+        if users_with_active_convos
+        else "none"
+    )
+
+    eval_prompt = f"""You are a Discord conversation manager. Current time: {current_time}
+Evaluate if the bot should respond to messages in channel #{channel_name}.
+
+RECENT CONVERSATION HISTORY (with timestamps):
+{context_str}
+
+ACTIVE CONVERSATIONS (users bot talked to recently): {active_users_str}
+
+NEW MESSAGES IN CHANNEL:
 {batch_content}
 
-Decision Rules:
-- If the bot was mentioned, a response is highly expected unless the problem was already solved by someone else in the batch.
-- RESPOND if there are questions, interesting statements, or a need for the bot's expertise.
-- SKIP if the conversation is spam, gibberish, or doesn't require an AI response.
+Decision Rules (check in order):
+1. MUST RESPOND if any user in the batch has an active conversation with the bot.
+2. MUST RESPOND if users are directly addressing or replying to the bot.
+3. MUST RESPOND if there are questions directed at the bot or clear need for AI help.
+4. RESPOND if there are interesting statements worth commenting on.
+5. SKIP only if: spam, gibberish, clearly private conversation between other people, or conversation has naturally ended.
 
-Respond ONLY with one of the following codes:
-- SKIP: No response needed.
-- REPLY_CHANNEL: Give a general response to the group.
-- REPLY_MESSAGE:<id>: Reply specifically to a message ID.
+Key insight: If the bot recently responded to a user and they continue talking, continue the conversation.
 
-Batch Mentioned: {has_mention}
+Respond with exactly one line:
+1. "RESPOND" or "SKIP"
 
-Your decision:"""
+Your evaluation:"""
 
-    logger.debug(f"Evaluating batch for #{channel_name}")
+    logger.debug(
+        f"Evaluating batch for #{channel_name}, active_users={users_with_active_convos}"
+    )
     try:
-        # Use a temporary history for evaluation to avoid polluting it
         test_history = [{"role": "user", "content": eval_prompt}]
         messages_for_api = build_messages_with_system(test_history)
 
         async with client.session.post(API_URL, json={"model": MODEL, "messages": messages_for_api, "stream": False}) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                decision = data['message']['content'].strip()
+                if not isinstance(data, dict) or "message" not in data:
+                    logger.error(f"Invalid response structure: {data}")
+                    return False
+                decision = data["message"].get("content", "").strip().upper()
 
-                if decision == "SKIP":
-                    return "SKIP", None
-                elif decision == "REPLY_CHANNEL":
-                    return "REPLY_CHANNEL", None
-                elif decision.startswith("REPLY_MESSAGE:"):
-                    msg_id = decision.split(":")[1].strip()
-                    return "REPLY_MESSAGE", msg_id
+                if users_with_active_convos and "RESPOND" in decision:
+                    logger.warning(
+                        f"Batch SKIPped despite active conversations with: {users_with_active_convos}"
+                    )
+                    logger.debug(
+                        f"Full evaluation response: {data['message'].get('content', '')}"
+                    )
 
-                logger.warning(f"Unexpected decision from LLM: {decision}")
-                return "SKIP", None
+                should_respond = decision == "RESPOND"
+                if not should_respond:
+                    logger.debug(f"Batch evaluation: SKIP for #{channel_name}")
+                return should_respond
     except Exception as e:
-        logger.error(f"Error in evaluate_batch: {e}")
+        logger.error(f"Error in evaluate_auto_response_batch: {e}")
+        return False
 
-    return "SKIP", None
+    return False
+
 
 async def get_ollama_response(prompt, guild_id, channel_id, include_context=False):
     """
@@ -320,7 +493,18 @@ async def get_ollama_response(prompt, guild_id, channel_id, include_context=Fals
         async with client.session.post(API_URL, json={"model": MODEL, "messages": messages_for_api, "stream": False}) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                reply = data['message']['content']
+                # Validate response structure before accessing
+                if (
+                    not isinstance(data, dict)
+                    or "message" not in data
+                    or not isinstance(data["message"], dict)
+                ):
+                    logger.error(f"Invalid Ollama response structure: {data}")
+                    return "⚠️ I received an invalid response from the AI server."
+                reply = data["message"].get("content")
+                if not reply:
+                    logger.error(f"Empty or missing content in Ollama response: {data}")
+                    return "⚠️ The AI server returned an empty response."
 
                 # Add assistant response to history
                 history.append({"role": "assistant", "content": reply})
@@ -335,48 +519,95 @@ async def get_ollama_response(prompt, guild_id, channel_id, include_context=Fals
         logger.error(f"Ollama connection error: {e}")
         return "⚠️ I'm currently unable to reach the AI server. Please try again in a moment."
 
-async def should_auto_respond(message_content, channel_name, guild_id, channel_id):
+
+async def should_auto_respond(
+    message_content, channel_name, guild_id, channel_id, author_name=None
+):
     """
     Use the LLM to evaluate if a message is interesting enough to warrant a response.
     Returns (should_respond: bool, reason: str)
     """
-    eval_prompt = f"""You are a helpful Discord bot that can join conversations.
-Evaluate if the following message deserves a response.
+    history = load_history(guild_id, channel_id)
 
-Message from #{channel_name}: "{message_content}"
+    # Get active conversations
+    active_conversations = get_active_conversations(guild_id, channel_id)
+    has_active_conversation = (
+        author_name in active_conversations if author_name else False
+    )
 
-Respond with only two lines:
+    # Build context from recent history with timestamps
+    context_lines = []
+    for msg in history[-10:]:
+        if isinstance(msg, dict) and "role" in msg and "content" in msg:
+            role_label = (
+                "Bot" if msg["role"] == "assistant" else msg.get("author", "User")
+            )
+            ts_str = (
+                msg.get("timestamp", "")[:19] if msg.get("timestamp") else "???:??:??"
+            )
+            content = msg["content"][:120]
+            context_lines.append(f"[{ts_str}] {role_label}: {content}")
+    context_str = (
+        "\n".join(context_lines) if context_lines else "No recent conversation history."
+    )
+
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    eval_prompt = f"""You are evaluating if a Discord bot should respond to a message. Current time: {current_time}
+
+RECENT CONVERSATION HISTORY (with timestamps):
+{context_str}
+
+NEW MESSAGE from [{author_name or 'Unknown'}] in #{channel_name}:
+"{message_content}"
+
+ACTIVE CONVERSATION WITH THIS USER: {'Yes' if has_active_conversation else 'No'}
+
+Decision Rules (check in order):
+1. MUST RESPOND if this user has an active conversation with the bot.
+2. MUST RESPOND if the user is asking a question or directly addressing the bot.
+3. RESPOND to interesting statements, conversation starters, or when you have relevant context.
+4. SKIP only if: spam, gibberish, clearly private conversation between other people, or too short/unclear.
+
+Key insight: If the bot and this user were just talking, continue the conversation.
+
+Respond with exactly two lines:
 1. "RESPOND" or "SKIP"
 2. A brief reason (one sentence)
 
-Rules:
-- RESPOND to questions, interesting statements, or conversation starters
-- RESPOND if you have relevant context from previous conversations
-- SKIP if it's clearly spam, gibberish, or a private conversation between others
-- SKIP if it's too short (< 5 words) and has no clear meaning
-
 Your evaluation:"""
 
-    logger.debug(f"Evaluating auto-response for message in #{channel_name}")
+    logger.debug(
+        f"Evaluating auto-response for [{author_name}] in #{channel_name}, active_conversation={has_active_conversation}"
+    )
     try:
-        # Use a separate request that doesn't modify history
-        test_history = load_history(guild_id, channel_id)[-10:]  # Only recent context for evaluation
-        test_history.append({"role": "user", "content": eval_prompt})
+        test_history = [{"role": "user", "content": eval_prompt}]
         messages_for_api = build_messages_with_system(test_history)
 
         async with client.session.post(API_URL, json={"model": MODEL, "messages": messages_for_api, "stream": False, "options": {"temperature": TEMPERATURE, "top_p": TOP_P, "num_predict": NUM_PREDICT}}) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                evaluation = data['message']['content']
+                if not isinstance(data, dict) or "message" not in data:
+                    logger.error(
+                        f"Invalid response structure in should_auto_respond: {data}"
+                    )
+                    return False, "Invalid response from AI server"
+                evaluation = data["message"].get("content", "")
                 lines = evaluation.strip().split('\n')
                 should_respond = lines[0].upper() == "RESPOND" if lines else False
                 reason = lines[1] if len(lines) > 1 else "No reason given"
+
+                if has_active_conversation and not should_respond:
+                    logger.warning(
+                        f"should_auto_respond SKIPped despite active conversation with [{author_name}]"
+                    )
+
                 logger.debug(f"Auto-response evaluation: {'RESPOND' if should_respond else 'SKIP'} - {reason}")
                 return should_respond, reason
     except Exception as e:
         logger.error(f"Error in should_auto_respond: {e}")
+        return False, "Error evaluating message"
 
-    return False, "Error evaluating message"
 
 async def send_chunked_response(channel, content, reply_to=None):
     """Send a response in chunks of 2000 characters, replying to a specific message if needed."""
@@ -394,7 +625,8 @@ async def status(interaction: discord.Interaction):
         f"🤖 **Bot Status**\n"
         f"**Model:** `{MODEL}`\n"
         f"**Latency:** `{latency}ms`\n"
-        f"**Auto-response:** {'Enabled' if CHANNEL_RESPONSE_ENABLED else 'Disabled'}"
+        f"**Auto-response:** {'Enabled' if CHANNEL_RESPONSE_ENABLED else 'Disabled'}\n"
+        f"**Conversation window:** `{CONVERSATION_WINDOW_MINUTES} minutes`"
     )
 
 @client.tree.command(name="clear_history", description="Clear the conversation history")
@@ -465,24 +697,29 @@ async def on_message(message):
         return
 
     # Update history immediately so the bot has context of all messages
-    # We use a simple formatted string for history
-    history_content = f"{message.author.display_name} says: {message.content}"
-    add_to_history(guild_id, channel_id, "user", history_content)
+    add_to_history(
+        guild_id,
+        channel_id,
+        "user",
+        message.content,
+        author=message.author.display_name,
+    )
 
     # Check if bot is mentioned (takes priority)
-    is_mentioned = client.user.mentioned_in(message) or is_bot_mentioned(message.content)
+    is_mentioned = client.user.mentioned_in(message)
 
     if is_mentioned:
         logger.info(f"[MENTION] {message.author.display_name} mentioned bot in #{message.channel.name}")
-        # Handle direct mention - enqueue for response
-        async with client.queue_lock:
-            client.response_queue.append({
-                "message": message,
-                "timestamp": message.created_at.timestamp(),
-                "channel_id": channel_id,
-                "guild_id": guild_id,
-                "is_mention": True
-            })
+        # Handle direct mention - respond immediately
+        try:
+            await message.channel.typing()
+            response = await get_ollama_response(
+                message.content, guild_id, channel_id, include_context=True
+            )
+            await send_chunked_response(message.channel, response, reply_to=message)
+            logger.info(f"Response sent to mention in #{message.channel.name}")
+        except Exception as e:
+            logger.error(f"Error handling mention: {e}")
         return
 
     # Channel auto-response (only if enabled and not a mention)
@@ -509,13 +746,14 @@ async def on_message(message):
         if should_respond:
             logger.info(f"[AUTO-RESPOND] Will respond in #{message.channel.name}: {reason}")
             async with client.queue_lock:
-                client.response_queue.append({
-                    "message": message,
-                    "timestamp": message.created_at.timestamp(),
-                    "channel_id": channel_id,
-                    "guild_id": guild_id,
-                    "is_mention": False
-                })
+                client.response_queue.append(
+                    {
+                        "message": message,
+                        "timestamp": message.created_at.timestamp(),
+                        "channel_id": channel_id,
+                        "guild_id": guild_id,
+                    }
+                )
         else:
             logger.debug(f"[AUTO-RESPOND] Skipping message in #{message.channel.name}: {reason}")
 

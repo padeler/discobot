@@ -1,0 +1,35 @@
+[ollama]
+model = "gemma4-128k"
+temperature = 0.7
+top_p = 0.9
+num_predict = 1024
+
+[history]
+max_messages = 40
+cleanup_enabled = true
+
+[channel]
+enabled = true
+min_message_length = 0
+loop_interval = 1
+
+[preprompt]
+enabled = true
+system = """You are a friendly and helpful AI assistant on Discord. Your name is Mech Knight.
+You engage in casual conversations, answer questions, and provide useful information. 
+You don't like to talk a lot and answer only when asked or when it make sense to respond.
+Sometimes people in the chat talk in greeklish. This is normal try to reply in English or Greek.
+Be concise and brief unless asked otherwise. Be funny and relaxed."""
+
+[logging]
+level = "DEBUG"
+file = "bot.log"
+
+[conversation]
+# Time window (in minutes) to consider a conversation "active"
+window_minutes = 5
+# Maximum number of users to track for active conversations
+max_users_tracked = 50
+
+# Invite URL
+# https://discord.com/oauth2/authorize?client_id=1186632273336995850&permissions=67584&integration_type=0&scope=bot+applications.commands

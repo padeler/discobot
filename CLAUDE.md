@@ -19,13 +19,19 @@ Simple Discord AI is a Python Discord bot that integrates with Ollama for local 
 
 ### Key Design Patterns
 
-1. **Conversation History Management**: History is loaded/saved to `history.json` with configurable max size and automatic cleanup to prevent unbounded growth
+1. **Enhanced History Format**: Each history entry contains:
+   - `role`: 'user' or 'assistant'
+   - `content`: Message text
+   - `timestamp`: ISO format timestamp for time-based filtering
+   - `author`: Username (for users) or 'bot' (for assistant)
 
-2. **Two-tier Response System**:
+2. **Active Conversation Tracking**: Bot maintains a list of users it has recently spoken with (within configurable time window). These users are prioritized for auto-response to maintain conversation flow.
+
+3. **Two-tier Response System**:
    - Mention-triggered responses (highest priority, always responds)
    - Auto-response evaluation using a separate LLM call to determine if a channel message deserves a response
 
-3. **Chunked Message Sending**: Responses exceeding 2000 characters are split into multiple messages while maintaining reply threading
+4. **Chunked Message Sending**: Responses exceeding 2000 characters are split into multiple messages while maintaining reply threading
 
 ### Data Flow
 
@@ -49,9 +55,10 @@ Install with: `pip install -r requirements.txt`
 The bot reads from `config.toml` (copy from `config.example.toml`):
 
 - `[discord]`: Bot token
-- `[ollama]`: Model name (e.g., `gemma4`, `llama3.2`)
+- `[ollama]`: Model name (e.g., `gemma4`, `llama3.2`), temperature, top_p, num_predict
 - `[history]`: Max messages retained, cleanup toggle
-- `[channel]`: Auto-response enable/disable, minimum message length
+- `[channel]`: Auto-response enable/disable, minimum message length, loop interval
+- `[conversation]`: Active conversation window (minutes), max users tracked
 - `[logging]`: Log level and file path
 - `[preprompt]`: System prompt to set bot character/personality (enabled/disabled, system message)
 
@@ -66,3 +73,4 @@ The bot reads from `config.toml` (copy from `config.example.toml`):
 - The bot requires `message_content` intent enabled via `discord.Intents.default()` with `intents.message_content = True`
 - Auto-response evaluation uses a temporary history copy to avoid polluting conversation history
 - The bot skips: its own messages, other bots' messages, DMs (for auto-response), and messages under minimum length threshold
+- History files are automatically migrated from old format (embedded usernames in content) to new format (structured fields with timestamps)
