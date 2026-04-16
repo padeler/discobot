@@ -3,7 +3,7 @@ import logging
 import os
 import discord
 from discord import app_commands
-import toml
+import yaml
 import aiohttp
 import re
 import asyncio
@@ -20,15 +20,13 @@ TOKEN = os.getenv(
 
 if not TOKEN:
     raise EnvironmentError(
-        "DISCORD_TOKEN environment variable not set. Please set it in your environment or in config.toml"
+        "DISCORD_TOKEN environment variable not set. Please set it in your environment or in config.yaml"
     )
 
 # Configuration
-config = toml.load("config.toml")
-MODEL = config['ollama']['model']
-TEMPERATURE = config['ollama'].get('temperature', 0.7)
-TOP_P = config['ollama'].get('top_p', 0.9)
-NUM_PREDICT = config['ollama'].get('num_predict', 1024)
+with open("config.yaml") as f:
+    config = yaml.safe_load(f)
+MODEL = config["ollama"]["model"]
 API_URL = config["ollama"]["api_url"]
 HISTORY_DIR = Path("data/history")
 HISTORY_DIR.mkdir(parents=True, exist_ok=True)
@@ -235,8 +233,12 @@ def add_to_history(guild_id, channel_id, role, content, author=None):
     return entry
 
 
-def build_messages_with_system(user_messages):
-    """Prepend system prompt to messages if enabled."""
+def build_messages_with_system(user_messages, current_time=None):
+    """Prepend system prompt and optional time to messages if enabled."""
+    if current_time:
+        user_messages.append(
+            {"role": "system", "content": f"Current time: {current_time}"}
+        )
     if not PREPROMPT_ENABLED:
         return user_messages
     return [{"role": "system", "content": PREPROMPT_SYSTEM}] + user_messages
@@ -273,37 +275,74 @@ class MyBot(discord.Client):
 
     @tasks.loop(seconds=LOOP_INTERVAL)
     async def process_messages_loop(self):
-        """Periodically process queued auto-response messages and generate responses."""
+        """Process all queued messages: mentions first, then auto-response evaluation."""
         try:
             async with self.queue_lock:
                 if not self.response_queue:
                     return
-
-                # Copy and clear the queue
                 current_batch = list(self.response_queue)
                 self.response_queue.clear()
 
-            logger.info(
-                f"Processing batch of {len(current_batch)} auto-response messages"
-            )
+            # Separate mentions from auto-queue
+            mentions = [r for r in current_batch if r.get("msg_type") == "mention"]
+            auto_msgs = [r for r in current_batch if r.get("msg_type") != "mention"]
 
-            # Group requests by channel
+            # --- Process mentions (highest priority) ---
+            for req in mentions:
+                message = req["message"]
+                guild_id = req["guild_id"]
+                channel_id = req["channel_id"]
+
+                logger.info(
+                    f"[MENTION] {message.author.display_name} mentioned bot in #{message.channel.name}"
+                )
+                try:
+                    add_to_history(
+                        guild_id,
+                        channel_id,
+                        "user",
+                        message.content,
+                        author=message.author.display_name,
+                    )
+                    await message.channel.typing()
+                    response = await get_ollama_response(
+                        message.content, guild_id, channel_id
+                    )
+                    await send_chunked_response(
+                        message.channel, response, reply_to=message
+                    )
+                    logger.info(f"Response sent to mention in #{message.channel.name}")
+                except Exception as e:
+                    logger.error(f"Error handling mention: {e}")
+
+            # --- Process auto-response queue ---
+            if not auto_msgs:
+                return
+
+            # Update history for auto-messages, then group by channel
             channels_map = {}
-            for req in current_batch:
+            for req in auto_msgs:
+                message = req["message"]
+                guild_id = req["guild_id"]
+                channel_id = req["channel_id"]
+                add_to_history(
+                    guild_id,
+                    channel_id,
+                    "user",
+                    message.content,
+                    author=message.author.display_name,
+                )
                 cid = req['channel_id']
                 if cid not in channels_map:
                     channels_map[cid] = []
                 channels_map[cid].append(req)
 
             for channel_id, requests in channels_map.items():
-                # Get the channel object
                 channel = self.get_channel(channel_id)
                 if not channel:
                     logger.warning(f"Could not find channel {channel_id}, skipping")
                     continue
 
-                # Evaluate the batch to decide if we should respond
-                # Load history to provide conversation context
                 history = load_history(requests[0]["guild_id"], channel_id)
                 should_respond = await evaluate_auto_response_batch(
                     channel.name, requests, history
@@ -314,15 +353,12 @@ class MyBot(discord.Client):
                     continue
 
                 logger.info(f"Responding to #{channel.name}")
-
                 try:
                     await channel.typing()
-                    # Get response using conversation history
                     response = await get_ollama_response(
                         "Please provide a response to the recent conversation in the channel.",
                         requests[0]["guild_id"],
                         requests[0]["channel_id"],
-                        include_context=True,
                     )
                     await send_chunked_response(channel, response)
                     logger.info(f"Response sent in #{channel.name}")
@@ -408,7 +444,7 @@ Your evaluation:"""
     )
     try:
         test_history = [{"role": "user", "content": eval_prompt}]
-        messages_for_api = build_messages_with_system(test_history)
+        messages_for_api = build_messages_with_system(test_history, current_time)
 
         async with client.session.post(API_URL, json={"model": MODEL, "messages": messages_for_api, "stream": False}) as resp:
             if resp.status == 200:
@@ -437,7 +473,7 @@ Your evaluation:"""
     return False
 
 
-async def get_ollama_response(prompt, guild_id, channel_id, include_context=False):
+async def get_ollama_response(prompt, guild_id, channel_id):
     """
     Get response from Ollama API with optional conversation context.
 
@@ -445,24 +481,15 @@ async def get_ollama_response(prompt, guild_id, channel_id, include_context=Fals
         prompt: The user's message/prompt
         guild_id: The ID of the server
         channel_id: The ID of the channel
-        include_context: Whether to include recent conversation summary
     """
     # Load history once and reuse it
     history = load_history(guild_id, channel_id)
 
-    # Build the message with optional context from history
-    full_prompt = prompt
-    if include_context and history:
-        context_parts = format_history_context(history, 10)
-        full_prompt = f"Recent conversation context:\n{context_parts}\n\n{prompt}"
-
-    logger.debug(f"Prompt ({'with context' if include_context else 'no context'}): {full_prompt[:100]}...")
-
-    # NOTE: User messages are now added to history in on_message.
-    # We only need to add the assistant response here.
-
-    # Build messages with system prompt for API request
-    messages_for_api = build_messages_with_system(history)
+    # Build messages with system prompt, current time, and user prompt for API request
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    user_messages = list(history)
+    user_messages.append({"role": "user", "content": prompt})
+    messages_for_api = build_messages_with_system(user_messages, now)
 
     try:
         async with client.session.post(API_URL, json={"model": MODEL, "messages": messages_for_api, "stream": False}) as resp:
@@ -493,81 +520,6 @@ async def get_ollama_response(prompt, guild_id, channel_id, include_context=Fals
     except Exception as e:
         logger.error(f"Ollama connection error: {e}")
         return "⚠️ I'm currently unable to reach the AI server. Please try again in a moment."
-
-
-async def should_auto_respond(
-    message_content, channel_name, guild_id, channel_id, author_name=None
-):
-    """
-    Use the LLM to evaluate if a message is interesting enough to warrant a response.
-    Returns (should_respond: bool, reason: str)
-    """
-    history = load_history(guild_id, channel_id)
-
-    # Get active conversations
-    active_conversations = get_active_conversations(guild_id, channel_id)
-    has_active_conversation = (
-        author_name in active_conversations if author_name else False
-    )
-
-    context_str = format_history_context(history, 10)
-
-    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    eval_prompt = f"""You are evaluating if a Discord bot should respond to a message. Current time: {current_time}
-
-RECENT CONVERSATION HISTORY (with timestamps):
-{context_str}
-
-NEW MESSAGE from [{author_name or 'Unknown'}] in #{channel_name}:
-"{message_content}"
-
-ACTIVE CONVERSATION WITH THIS USER: {'Yes' if has_active_conversation else 'No'}
-
-Decision Rules (check in order):
-1. MUST RESPOND if this user has an active conversation with the bot.
-2. MUST RESPOND if the user is asking a question or directly addressing the bot.
-3. RESPOND to interesting statements, conversation starters, or when you have relevant context.
-4. SKIP only if: spam, gibberish, clearly private conversation between other people, or too short/unclear.
-
-Key insight: If the bot and this user were just talking, continue the conversation.
-
-Respond with exactly two lines:
-1. "RESPOND" or "SKIP"
-2. A brief reason (one sentence)
-
-Your evaluation:"""
-
-    logger.debug(
-        f"Evaluating auto-response for [{author_name}] in #{channel_name}, active_conversation={has_active_conversation}"
-    )
-    try:
-        test_history = [{"role": "user", "content": eval_prompt}]
-        messages_for_api = build_messages_with_system(test_history)
-
-        async with client.session.post(API_URL, json={"model": MODEL, "messages": messages_for_api, "stream": False, "options": {"temperature": TEMPERATURE, "top_p": TOP_P, "num_predict": NUM_PREDICT}}) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                if not isinstance(data, dict) or "message" not in data:
-                    logger.error(
-                        f"Invalid response structure in should_auto_respond: {data}"
-                    )
-                    return False, "Invalid response from AI server"
-                evaluation = data["message"].get("content", "")
-                lines = evaluation.strip().split('\n')
-                should_respond = lines[0].upper() == "RESPOND" if lines else False
-                reason = lines[1] if len(lines) > 1 else "No reason given"
-
-                if has_active_conversation and not should_respond:
-                    logger.warning(
-                        f"should_auto_respond SKIPped despite active conversation with [{author_name}]"
-                    )
-
-                logger.debug(f"Auto-response evaluation: {'RESPOND' if should_respond else 'SKIP'} - {reason}")
-                return should_respond, reason
-    except Exception as e:
-        logger.error(f"Error in should_auto_respond: {e}")
-        return False, "Error evaluating message"
 
 
 async def send_chunked_response(channel, content, reply_to=None):
@@ -613,23 +565,27 @@ async def set_min_length(interaction: discord.Interaction, length: int):
 
     AUTO_RESPOND_MIN_LENGTH = length
 
-    # Persist to config.toml
+    # Persist to config.yaml
     try:
-        config_path = Path("config.toml")
+        config_path = Path("config.yaml")
         if config_path.exists():
-            current_config = toml.load(config_path)
+            with open(config_path, "r", encoding="utf-8") as f:
+                current_config = yaml.safe_load(f)
             if 'channel' not in current_config:
                 current_config['channel'] = {}
             current_config['channel']['min_message_length'] = length
             with open(config_path, 'w', encoding='utf-8') as f:
-                toml.dump(current_config, f)
-            logger.info(f"Updated min_message_length to {length} in config.toml")
+                yaml.dump(
+                    current_config, f, default_flow_style=False, allow_unicode=True
+                )
+            logger.info(f"Updated min_message_length to {length} in config.yaml")
     except Exception as e:
-        logger.error(f"Failed to persist min_message_length to config.toml: {e}")
+        logger.error(f"Failed to persist min_message_length to config.yaml: {e}")
         await interaction.response.send_message(f"✅ Length set to `{length}`, but failed to save to config file.", ephemeral=True)
         return
 
     await interaction.response.send_message(f"✅ Minimum auto-response length set to `{length}` characters and saved.")
+
 
 @client.event
 async def on_ready():
@@ -638,81 +594,36 @@ async def on_ready():
     logger.info(f"Channel response enabled: {CHANNEL_RESPONSE_ENABLED}")
     logger.info(f"Log file: {LOG_FILE}")
 
+
 @client.event
 async def on_message(message):
-    # Extract IDs for history tracking
     guild_id = message.guild.id if message.guild else None
     channel_id = message.channel.id
 
-    logger.debug(f"Message received from {message.author.display_name} in #{message.channel.name}: {message.content[:50]}...")
-
     # Skip bot messages and self-messages
     if message.author.bot:
-        logger.debug(f"Skipping bot message from {message.author.display_name}")
         return
     if message.author == client.user:
-        logger.debug("Skipping self-message")
         return
 
-    # Update history immediately so the bot has context of all messages
-    add_to_history(
-        guild_id,
-        channel_id,
-        "user",
-        message.content,
-        author=message.author.display_name,
+    # Check if bot is mentioned
+    is_mentioned = client.user.mentioned_in(message)
+    msg_type = "mention" if is_mentioned else "auto"
+
+    logger.debug(
+        f"Queuing message from {message.author.display_name} in #{message.channel.name} as {msg_type}"
     )
 
-    # Check if bot is mentioned (takes priority)
-    is_mentioned = client.user.mentioned_in(message)
+    async with client.queue_lock:
+        client.response_queue.append(
+            {
+                "message": message,
+                "msg_type": msg_type,
+                "timestamp": message.created_at.timestamp(),
+                "channel_id": channel_id,
+                "guild_id": guild_id,
+            }
+        )
 
-    if is_mentioned:
-        logger.info(f"[MENTION] {message.author.display_name} mentioned bot in #{message.channel.name}")
-        # Handle direct mention - respond immediately
-        try:
-            await message.channel.typing()
-            response = await get_ollama_response(
-                message.content, guild_id, channel_id, include_context=True
-            )
-            await send_chunked_response(message.channel, response, reply_to=message)
-            logger.info(f"Response sent to mention in #{message.channel.name}")
-        except Exception as e:
-            logger.error(f"Error handling mention: {e}")
-        return
-
-    # Channel auto-response (only if enabled and not a mention)
-    if CHANNEL_RESPONSE_ENABLED:
-        # Skip DMs for auto-response
-        if isinstance(message.channel, discord.DMChannel):
-            logger.debug("Skipping DM channel for auto-response")
-            return
-
-        # Skip very short messages
-        if len(message.content.strip()) < AUTO_RESPOND_MIN_LENGTH:
-            logger.debug(f"Skipping short message ({len(message.content.strip())} chars)")
-            return
-
-        # Skip if message is only mentions or links
-        cleaned = re.sub(r'<@!?\d+>', '', message.content).strip()
-        if not cleaned or len(cleaned) < 5:
-            logger.debug("Skipping message with only mentions/links")
-            return
-
-        # Evaluate if we should respond
-        should_respond, reason = await should_auto_respond(message.content, message.channel.name, guild_id, channel_id)
-
-        if should_respond:
-            logger.info(f"[AUTO-RESPOND] Will respond in #{message.channel.name}: {reason}")
-            async with client.queue_lock:
-                client.response_queue.append(
-                    {
-                        "message": message,
-                        "timestamp": message.created_at.timestamp(),
-                        "channel_id": channel_id,
-                        "guild_id": guild_id,
-                    }
-                )
-        else:
-            logger.debug(f"[AUTO-RESPOND] Skipping message in #{message.channel.name}: {reason}")
 
 client.run(TOKEN)
