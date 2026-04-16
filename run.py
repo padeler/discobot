@@ -29,7 +29,7 @@ MODEL = config['ollama']['model']
 TEMPERATURE = config['ollama'].get('temperature', 0.7)
 TOP_P = config['ollama'].get('top_p', 0.9)
 NUM_PREDICT = config['ollama'].get('num_predict', 1024)
-API_URL = 'http://localhost:11434/api/chat'
+API_URL = config["ollama"]["api_url"]
 HISTORY_DIR = Path("data/history")
 HISTORY_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -242,30 +242,18 @@ def build_messages_with_system(user_messages):
     return [{"role": "system", "content": PREPROMPT_SYSTEM}] + user_messages
 
 
-def get_context_summary_from_history(history):
-    """Extract relevant context from conversation history for channel responses."""
+def format_history_context(history, n=10):
+    """Format recent history messages for display in prompts."""
     if not history:
-        return ""
+        return "No recent conversation history."
+    lines = []
+    for msg in history[-n:]:
+        if isinstance(msg, dict) and "role" in msg and "content" in msg:
+            role = "Bot" if msg["role"] == "assistant" else msg.get("author", "User")
+            ts = msg.get("timestamp", "")[:19] if msg.get("timestamp") else "???:??:??"
+            lines.append(f"[{ts}] {role}: {msg['content'][:120]}")
+    return "\n".join(lines) if lines else "No recent conversation history."
 
-    # Get the last few assistant responses to understand recent topics
-    recent_topics = []
-    for msg in reversed(history[-10:]):
-        if (
-            isinstance(msg, dict)
-            and msg.get("role") == "assistant"
-            and len(recent_topics) < 3
-        ):
-            # Get first sentence or short summary
-            content = msg.get("content", "")[:200]
-            if '.' in content:
-                content = content.split('.')[0] + '.'
-            recent_topics.append(content)
-
-    if recent_topics:
-        return "Recent conversation topics: " + " ".join(recent_topics) + "\n\n"
-    return ""
-
-# Remove global history variable as it's no longer used
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -383,27 +371,12 @@ async def evaluate_auto_response_batch(channel_name, requests, history):
     batch_users = set(req["message"].author.display_name for req in requests)
     users_with_active_convos = batch_users & set(active_conversations.keys())
 
-    # Build context from recent history with timestamps
-    context_lines = []
-    for msg in history[-12:]:
-        if isinstance(msg, dict) and "role" in msg and "content" in msg:
-            role_label = (
-                "Bot" if msg["role"] == "assistant" else msg.get("author", "User")
-            )
-            ts_str = (
-                msg.get("timestamp", "")[:19] if msg.get("timestamp") else "???:??:??"
-            )
-            content = msg["content"][:120]
-            context_lines.append(f"[{ts_str}] {role_label}: {content}")
-    context_str = (
-        "\n".join(context_lines) if context_lines else "No recent conversation history."
-    )
-
     active_users_str = (
         ", ".join(f"@{u}" for u in users_with_active_convos)
         if users_with_active_convos
         else "none"
     )
+    context_str = format_history_context(history, 12)
 
     eval_prompt = f"""You are a Discord conversation manager. Current time: {current_time}
 Evaluate if the bot should respond to messages in channel #{channel_name}.
@@ -478,8 +451,10 @@ async def get_ollama_response(prompt, guild_id, channel_id, include_context=Fals
     history = load_history(guild_id, channel_id)
 
     # Build the message with optional context from history
-    context = get_context_summary_from_history(history) if include_context else ""
-    full_prompt = f"{context}{prompt}"
+    full_prompt = prompt
+    if include_context and history:
+        context_parts = format_history_context(history, 10)
+        full_prompt = f"Recent conversation context:\n{context_parts}\n\n{prompt}"
 
     logger.debug(f"Prompt ({'with context' if include_context else 'no context'}): {full_prompt[:100]}...")
 
@@ -535,21 +510,7 @@ async def should_auto_respond(
         author_name in active_conversations if author_name else False
     )
 
-    # Build context from recent history with timestamps
-    context_lines = []
-    for msg in history[-10:]:
-        if isinstance(msg, dict) and "role" in msg and "content" in msg:
-            role_label = (
-                "Bot" if msg["role"] == "assistant" else msg.get("author", "User")
-            )
-            ts_str = (
-                msg.get("timestamp", "")[:19] if msg.get("timestamp") else "???:??:??"
-            )
-            content = msg["content"][:120]
-            context_lines.append(f"[{ts_str}] {role_label}: {content}")
-    context_str = (
-        "\n".join(context_lines) if context_lines else "No recent conversation history."
-    )
+    context_str = format_history_context(history, 10)
 
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -676,9 +637,6 @@ async def on_ready():
     logger.info(f"Bot ID: {client.user.id}")
     logger.info(f"Channel response enabled: {CHANNEL_RESPONSE_ENABLED}")
     logger.info(f"Log file: {LOG_FILE}")
-    # Syncing commands can take a few seconds
-    await client.tree.sync()
-    logger.info("Command tree synced")
 
 @client.event
 async def on_message(message):
