@@ -10,7 +10,16 @@ history:
   max_messages: 40
 logging:
   file: bot.log
-  level: INFO
+  level: DEBUG
+mcp:
+  enabled: true
+  servers:
+    - name: duckduckgo-search
+      command: duckduckgo-mcp-server
+      args: []
+    - name: fetch
+      command: mcp-fetch-server
+      args: []
 ollama:
   api_url: http://192.168.1.2:11434/api/chat
   model: gemma4-128k

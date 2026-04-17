@@ -12,13 +12,27 @@ import requests
 import yaml
 from discord import app_commands
 from dotenv import load_dotenv
+import contextlib
+from mcp import ClientSession, StdioServerParameters, types
+from mcp.client.stdio import stdio_client
 
 load_dotenv()
 
-with open("config.yaml", "r") as f:
-    config = yaml.safe_load(f)
-
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+
+# MCP tool definitions (populated at startup)
+mcp_tools = []
+
+# Active MCP client sessions and transports, keyed by server name
+mcp_sessions: dict[str, ClientSession] = {}
+mcp_transports: dict[str, contextlib.AsyncExitStack] = {}
+
+def load_config():
+    with open("config.yaml", "r") as f:
+        return yaml.safe_load(f)
+
+
+config = load_config()
 
 logging.basicConfig(
     level=getattr(logging, config["logging"]["level"].upper()),
@@ -75,18 +89,155 @@ def cleanup_history(guild_id: int, channel_id: int) -> None:
         logger.debug(f"Cleaned up history for {guild_id}_{channel_id}")
 
 
-def call_ollama(messages: list[dict]) -> str:
+async def setup_mcp():
+    global mcp_tools
+    mcp_config = config.get("mcp", {})
+    if not mcp_config.get("enabled", False):
+        logger.info("MCP is disabled in config")
+        return
+
+    servers = mcp_config.get("servers", [])
+    if not servers:
+        logger.info("No MCP servers configured")
+        return
+
+    all_tools = []
+
+    for server in servers:
+        name = server["name"]
+        command = server["command"]
+        args = server.get("args", [])
+        logger.info(f"Starting MCP server: {name}")
+
+        server_params = StdioServerParameters(
+            command=command,
+            args=args,
+        )
+
+        try:
+            # Create an exit stack to manage the MCP transport lifecycle
+            stack = contextlib.AsyncExitStack()
+            mcp_transports[name] = stack
+
+            # Keep stdio transport alive for the lifetime of the bot
+            transport = await stack.enter_async_context(stdio_client(server_params))
+            read, write = transport
+
+            session = ClientSession(read, write)
+            await stack.enter_async_context(session)
+            await session.initialize()
+
+            mcp_sessions[name] = session
+
+            tools_result = await session.list_tools()
+            server_tools = []
+            for tool in tools_result.tools:
+                mcp_tools_entry = {
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description or "",
+                        "parameters": {
+                            "type": "object",
+                            "properties": tool.inputSchema.get("properties", {})
+                            if tool.inputSchema else {},
+                            "required": tool.inputSchema.get("required", [])
+                            if tool.inputSchema else [],
+                        },
+                    },
+                }
+                server_tools.append(mcp_tools_entry)
+                all_tools.append(mcp_tools_entry)
+                logger.info(f"  Tool: {tool.name} - {tool.description}")
+
+            mcp_tools = all_tools
+            logger.info(f"MCP server '{name}' ready with {len(server_tools)} tools")
+        except Exception as e:
+            logger.error(f"Failed to start MCP server '{name}': {e}")
+
+    logger.info(f"Total MCP tools available: {len(mcp_tools)}")
+
+
+async def execute_mcp_tool(tool_name: str, arguments: dict) -> str:
+    # Find which server owns this tool by checking all sessions
+    for server_name, session in mcp_sessions.items():
+        try:
+            tools_result = await session.list_tools()
+            for tool in tools_result.tools:
+                if tool.name == tool_name:
+                    result = await session.call_tool(tool_name, arguments)
+                    # Convert result to string
+                    parts = []
+                    for content in result.content:
+                        if isinstance(content, types.TextContent):
+                            parts.append(content.text)
+                        elif hasattr(content, "text"):
+                            parts.append(str(content.text))
+                        else:
+                            parts.append(str(content))
+                    return "\n".join(parts) if parts else str(result)
+        except Exception as e:
+            logger.error(f"Error calling tool '{tool_name}' on server '{server_name}': {e}")
+            return f"Error calling tool '{tool_name}': {e}"
+
+    return f"Error: tool '{tool_name}' not found on any MCP server"
+
+async def call_ollama(messages: list[dict]) -> str:
     url = config["ollama"]["api_url"]
     payload = {
         "model": config["ollama"]["model"],
         "messages": messages,
         "stream": False,
+        "tools": mcp_tools if mcp_tools else None,
     }
-    logger.debug(f"Calling Ollama: {payload}")
-    resp = requests.post(url, json=payload, timeout=60)
-    resp.raise_for_status()
-    data = resp.json()
-    return data["message"]["content"]
+    if payload["tools"] is None:
+        del payload["tools"]
+
+    logger.debug(
+        f"Calling Ollama: model={payload['model']}, tools={len(mcp_tools) if mcp_tools else 0}"
+    )
+
+    max_tool_calls = 5
+    for _ in range(max_tool_calls):
+        resp = requests.post(url, json=payload, timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+        message = data["message"]
+        logger.debug(f"Ollama response: {message}")
+
+        # Check if model wants to call a tool
+        if "tool_calls" in message and message["tool_calls"]:
+            for tool_call in message["tool_calls"]:
+                func = tool_call.get("function", {})
+                name = func.get("name", "")
+                args_str = func.get("arguments", "{}")
+                if isinstance(args_str, str):
+                    args = json.loads(args_str)
+                else:
+                    args = args_str
+
+                logger.info(f"Tool call: {name}({json.dumps(args)})")
+                tool_result = await execute_mcp_tool(name, args)
+                logger.debug(f"Tool result: {tool_result[:200]}")
+
+                # Add tool call + result to messages
+                messages.append(
+                    {"role": "assistant", "content": None, "tool_calls": [tool_call]}
+                )
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.get("id", "0"),
+                        "content": tool_result,
+                    }
+                )
+
+                # Update payload for next iteration
+                payload["messages"] = messages
+        else:
+            return message.get("content", "")
+
+    return "Error: exceeded maximum tool calls"
 
 
 def build_prompt(messages: list[dict]) -> list[dict]:
@@ -96,6 +247,15 @@ def build_prompt(messages: list[dict]) -> list[dict]:
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     msgs.append({"role": "system", "content": f"Current date/time: {now}"})
+
+    if mcp_tools:
+        tool_names = ", ".join(t["function"]["name"] for t in mcp_tools)
+        msgs.append(
+            {
+                "role": "system",
+                "content": f"You have access to web tools: {tool_names}. Use them when you need current information from the internet.",
+            }
+        )
 
     for m in messages:
         msgs.append({"role": m["role"], "content": m["content"]})
@@ -128,7 +288,7 @@ async def process_message(
 
     try:
         async with channel.typing():
-            response = await asyncio.to_thread(call_ollama, prompt)
+            response = await call_ollama(prompt)
             logger.info(f"Response: {response}")
 
         history[key].append(
@@ -174,12 +334,12 @@ async def evaluate_should_respond(
 
 "{content}"
 
-Respond with ONLY "YES" or "NO".""",
+Respond with ONLY "YES" or "NO.""",
         },
     ]
 
     try:
-        result = await asyncio.to_thread(call_ollama, eval_prompt)
+        result = await call_ollama(eval_prompt)
         should_respond = result.strip().upper().startswith("YES")
         logger.debug(f"Auto-response evaluation: {should_respond}")
         return should_respond
@@ -238,6 +398,19 @@ async def on_ready():
     logger.info(f"Synced {len(synced)} commands globally")
     for cmd in synced:
         logger.info(f"  - {cmd.name}")
+
+
+@client.event
+async def on_disconnect():
+    # Clean up MCP server transports
+    for name, stack in list(mcp_transports.items()):
+        try:
+            await stack.aclose()
+            logger.info(f"Closed MCP transport for '{name}'")
+        except Exception as e:
+            logger.error(f"Error closing MCP transport for '{name}': {e}")
+    mcp_transports.clear()
+    mcp_sessions.clear()
 
 
 @client.event
@@ -367,6 +540,7 @@ async def set_preprompt_command(interaction: discord.Interaction, preprompt: str
 
 
 async def main():
+    await setup_mcp()
     asyncio.create_task(message_processor())
     await client.start(DISCORD_TOKEN)
 

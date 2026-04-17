@@ -1,0 +1,6 @@
+FROM qwen3.6:35b-a3b-q4_K_M
+PARAMETER num_ctx 200000
+
+# Optimization for solo developer performance
+PARAMETER num_batch 512
+PARAMETER num_thread 8
