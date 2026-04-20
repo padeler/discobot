@@ -14,8 +14,8 @@ logging:
 mcp:
   enabled: true
   servers:
-    - name: duckduckgo-search
-      command: duckduckgo-mcp-server
+    - name: tavily-search
+      command: tavily-mcp
       args: []
     - name: fetch
       command: mcp-fetch-server
