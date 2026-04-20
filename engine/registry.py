@@ -8,7 +8,8 @@ from .parser import parse_skill_md, Skill
 
 logger = logging.getLogger(__name__)
 
-SKILLS_DIR = Path(__file__).parent
+# Point to the skills/ directory at the project root
+_SKILLS_DIR = Path(__file__).parent.parent / "skills"
 
 
 class SkillsRegistry:
@@ -16,7 +17,7 @@ class SkillsRegistry:
 
     def __init__(self):
         self.skills: dict[str, Skill] = {}
-        self.skills_dir: Path = SKILLS_DIR
+        self.skills_dir: Path = _SKILLS_DIR
 
     def load_all(self) -> int:
         """Scan skills/ directory and load all SKILL.md files."""

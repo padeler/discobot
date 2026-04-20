@@ -5,8 +5,6 @@ import os
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
-from queue import Queue
-
 import discord
 import requests
 import yaml
@@ -15,9 +13,8 @@ from dotenv import load_dotenv
 import contextlib
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
-from skills import registry, triggers
-from skills.timer_engine import get_engine
-
+from engine import registry, triggers
+from engine.timer_engine import get_engine
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -32,15 +29,28 @@ mcp_transports: dict[str, contextlib.AsyncExitStack] = {}
 # Local timer tools (non-MCP)
 # (defined after functions below)
 
+# Context for the current message being processed
+_current_author_id: int = 0
+
 async def _execute_add_reminder(args):
     engine = get_engine()
     channel_id = args.get("channel_id", 0)
     user_str = args["user"]
-    user_id = 0
+    message_author_id = args.get("message_author_id", 0)
+    
     if user_str.startswith("<@") or user_str.startswith("<@!"):
         user_id = int(user_str.strip("<>@!>"))
     elif user_str.isdigit():
         user_id = int(user_str)
+    else:
+        user_id = message_author_id
+    
+    # If user_id is still 0 (Llama didn't parse the mention or sent user_id=0), fall back to message_author_id
+    if not user_id and message_author_id:
+        user_id = message_author_id
+    elif not user_id:
+        user_id = channel_id
+    
     result = await engine.add_reminder(channel_id, user_str, args["message"], args["delay_minutes"], user_id)
     return f"Reminder set: {result['message']} in {result['time_until']} (ID: {result['id']})"
 
@@ -142,6 +152,11 @@ def load_config():
         return yaml.safe_load(f)
 
 
+def save_config():
+    with open("config.yaml", "w") as f:
+        yaml.dump(config, f)
+
+
 config = load_config()
 
 skills_registry = registry.get_registry()
@@ -163,7 +178,6 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
-message_queue: Queue = Queue()
 history: dict[str, list[dict]] = defaultdict(list)
 active_users: dict[int, dict[str, datetime]] = defaultdict(dict)
 
@@ -240,7 +254,7 @@ def create_skill_command(skill_name: str):
     return cmd
 
 
-def build_prompt(channel_id: int, messages: list[dict]) -> list[dict]:
+def build_prompt(channel_id: int, messages: list[dict], author_id: int) -> list[dict]:
     msgs = []
     if config["preprompt"]["enabled"]:
         msgs.append({"role": "system", "content": config["preprompt"]["system"]})
@@ -250,7 +264,7 @@ def build_prompt(channel_id: int, messages: list[dict]) -> list[dict]:
 
     skill_content = build_skill_injection(active_skills.get(channel_id, []))
     if skill_content:
-        msgs.append({"role": "system", "content": f"You have active skills:{skill_content}"})
+        msgs.append({"role": "system", "content": f"You have active skills:\n{skill_content}"})
 
     if mcp_tools:
         tool_names = ", ".join(t["function"]["name"] for t in mcp_tools)
@@ -260,6 +274,9 @@ def build_prompt(channel_id: int, messages: list[dict]) -> list[dict]:
                 "content": f"You have access to web tools: {tool_names}. Use them when you need current information from the internet.",
             }
         )
+    
+    if author_id:
+        msgs.append({"role": "system", "content": f"Current message author ID: {author_id}. You can use this in user_id fields."})
 
     for m in messages:
         msgs.append({"role": m["role"], "content": m["content"]})
@@ -344,10 +361,11 @@ async def setup_mcp():
     engine.start_monitor()
 
 
-async def execute_mcp_tool(tool_name: str, arguments: dict) -> str:
+async def execute_mcp_tool(tool_name: str, arguments: dict, author_id: int = 0) -> str:
     # Check local timer tools first before MCP servers
     for timer_tool in local_timer_tools:
                 if timer_tool["function"]["name"] == tool_name:
+                    arguments["message_author_id"] = author_id
                     return await _timer_tools[tool_name](arguments)
 
     # Find which server owns this tool by checking all sessions
@@ -410,7 +428,7 @@ async def call_ollama(messages: list[dict]) -> str:
                     args = args_str
 
                 logger.info(f"Tool call: {name}({json.dumps(args)})")
-                tool_result = await execute_mcp_tool(name, args)
+                tool_result = await execute_mcp_tool(name, args, _current_author_id)
                 logger.debug(f"Tool result: {tool_result[:200]}")
 
                 # Add tool call + result to messages
@@ -434,7 +452,7 @@ async def call_ollama(messages: list[dict]) -> str:
 
 
 async def process_message(
-    guild_id: int, channel_id: int, content: str, author: str, is_mention: bool
+    guild_id: int, channel_id: int, content: str, author: str, is_mention: bool, author_id: int = 0
 ) -> None:
     key = f"{guild_id}_{channel_id}"
 
@@ -456,14 +474,17 @@ async def process_message(
             "role": "user",
             "content": content,
             "author": author,
+            "author_id": author_id,
             "timestamp": datetime.now().isoformat(),
         }
     )
 
-    prompt = build_prompt(channel_id, history[key])
+    prompt = build_prompt(channel_id, history[key], author_id)
     logger.debug(f"Prompt: {prompt}")
 
     try:
+        global _current_author_id
+        _current_author_id = author_id
         async with channel.typing():
             response = await call_ollama(prompt)
             logger.info(f"Response: {response}")
@@ -525,48 +546,6 @@ Respond with ONLY "YES" or "NO.""",
         return False
 
 
-async def message_processor():
-    logger.info("Message processor loop started")
-    while True:
-        if not message_queue.empty():
-            logger.debug(f"Processing {message_queue.qsize()} messages")
-            while not message_queue.empty():
-                msg_data = message_queue.get()
-                guild_id = msg_data["guild_id"]
-                channel_id = msg_data["channel_id"]
-                content = msg_data["content"]
-                author = msg_data["author"]
-                is_mention = msg_data["is_mention"]
-
-                logger.info(
-                    f"Processing: guild={guild_id}, channel={channel_id}, "
-                    f"author={author}, mention={is_mention}, content={content[:50]}"
-                )
-
-                key = f"{guild_id}_{channel_id}"
-                active_users[channel_id][author] = datetime.now()
-
-                if is_mention:
-                    await process_message(guild_id, channel_id, content, author, is_mention)
-                elif config["channel"]["enabled"]:
-                    if await evaluate_should_respond(
-                        guild_id, channel_id, content, author
-                    ):
-                        await process_message(guild_id, channel_id, content, author, is_mention)
-                    else:
-                        history[f"{guild_id}_{channel_id}"].append(
-                            {
-                                "role": "user",
-                                "content": content,
-                                "author": author,
-                                "timestamp": datetime.now().isoformat(),
-                            }
-                        )
-                        save_history(guild_id, channel_id)
-
-        await asyncio.sleep(config["channel"]["loop_interval"])
-
-
 @client.event
 async def on_ready():
     logger.info(f"Logged in as {client.user} (ID: {client.user.id})")
@@ -618,16 +597,29 @@ async def on_message(message):
     if not content:
         return
 
-    message_queue.put(
-        {
-            "guild_id": message.guild.id if message.guild else 0,
-            "channel_id": message.channel.id,
-            "content": content,
-            "author": message.author.name,
-            "is_mention": is_mention,
-        }
-    )
-    logger.debug(f"Queued message from {message.author.name}: {content[:50]}")
+    if not content:
+        return
+
+    guild_id = message.guild.id if message.guild else 0
+    key = f"{guild_id}_{message.channel.id}"
+    active_users[message.channel.id][message.author.name] = datetime.now()
+
+    if is_mention:
+        await process_message(guild_id, message.channel.id, content, message.author.name, is_mention, message.author.id)
+    elif config["channel"]["enabled"]:
+        if await evaluate_should_respond(guild_id, message.channel.id, content, message.author.name):
+            await process_message(guild_id, message.channel.id, content, message.author.name, is_mention, message.author.id)
+        else:
+            history[key].append(
+                {
+                    "role": "user",
+                    "content": content,
+                    "author": message.author.name,
+                    "author_id": message.author.id,
+                    "timestamp": datetime.now().isoformat(),
+                }
+            )
+            save_history(guild_id, message.channel.id)
 
 
 @tree.command(name="status", description="Show bot status")
@@ -672,9 +664,7 @@ async def clear_history_command(interaction: discord.Interaction):
 @app_commands.describe(length="Minimum message length in characters")
 async def set_min_length_command(interaction: discord.Interaction, length: int):
     config["channel"]["min_message_length"] = length
-
-    with open("config.yaml", "w") as f:
-        yaml.dump(config, f)
+    save_config()
 
     logger.info(f"Set min_message_length to {length}")
     await interaction.response.send_message(
@@ -729,9 +719,7 @@ async def show_preprompt_command(interaction: discord.Interaction):
 async def set_preprompt_command(interaction: discord.Interaction, preprompt: str):
     config["preprompt"]["enabled"] = True
     config["preprompt"]["system"] = preprompt
-
-    with open("config.yaml", "w") as f:
-        yaml.dump(config, f)
+    save_config()
 
     logger.info("Updated preprompt")
     await interaction.response.send_message(
@@ -741,8 +729,16 @@ async def set_preprompt_command(interaction: discord.Interaction, preprompt: str
 
 async def main():
     await setup_mcp()
-    asyncio.create_task(message_processor())
+    asyncio.create_task(_start_reminder_monitor())
     await client.start(DISCORD_TOKEN)
+
+
+async def _start_reminder_monitor():
+    await asyncio.sleep(1)
+    engine = get_engine()
+    await engine.load()
+    engine.set_fire_callback(_fire_reminder_callback)
+    engine.start_monitor()
 
 
 if __name__ == "__main__":
