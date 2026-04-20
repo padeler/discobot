@@ -15,7 +15,7 @@ REMINDERS_FILE = Path("data/reminders.json")
 
 
 class Reminder:
-    def __init__(self, channel_id: int, user: str, message: str, delay_minutes: float, created_at: str):
+    def __init__(self, channel_id: int, user: str, message: str, delay_minutes: float, created_at: str, user_id: int = 0):
         self.id = str(uuid.uuid4())[:8]
         self.channel_id = channel_id
         self.user = user
@@ -23,6 +23,7 @@ class Reminder:
         self.delay_minutes = delay_minutes
         self.created_at = created_at
         self.fired = False
+        self.user_id = user_id
 
     def fire_at(self) -> datetime:
         return datetime.fromisoformat(self.created_at) + timedelta(minutes=self.delay_minutes)
@@ -44,6 +45,7 @@ class Reminder:
         return {
             "id": self.id,
             "channel_id": self.channel_id,
+            "user_id": self.user_id,
             "user": self.user,
             "message": self.message,
             "delay_minutes": self.delay_minutes,
@@ -57,6 +59,7 @@ class Reminder:
         r = cls(d["channel_id"], d["user"], d["message"], d["delay_minutes"], d["created_at"])
         r.id = d["id"]
         r.fired = d.get("fired", False)
+        r.user_id = d.get("user_id", 0)
         return r
 
 
@@ -88,8 +91,8 @@ class TimerEngine:
         data = [r.to_dict() for r in self.reminders]
         REMINDERS_FILE.write_text(json.dumps(data, indent=2))
 
-    async def add_reminder(self, channel_id: int, user: str, message: str, delay_minutes: float) -> dict:
-        r = Reminder(channel_id, user, message, delay_minutes, datetime.now().isoformat())
+    async def add_reminder(self, channel_id: int, user: str, message: str, delay_minutes: float, user_id: int = 0) -> dict:
+        r = Reminder(channel_id, user, message, delay_minutes, datetime.now().isoformat(), user_id)
         self.reminders.append(r)
         await self.save()
         logger.info("Reminder %r: '%s' in %.0f min", r.id, message, delay_minutes)
@@ -116,6 +119,8 @@ class TimerEngine:
     async def _fire(self, reminder: Reminder):
         reminder.fired = True
         await self.save()
+        logger.info("Reminder firing: id=%r, channel_id=%d, user=%s, user_id=%d, message=%r", 
+                    reminder.id, reminder.channel_id, reminder.user, reminder.user_id, reminder.message)
         if self._on_fire_callback:
             await self._on_fire_callback(reminder)
         logger.info("Reminder fired: %r", reminder.id)
@@ -173,7 +178,7 @@ async def execute_timer_tool(name: str, args: dict):
             return "No pending reminders."
         lines = [f"### Pending Reminders"]
         for r in reminders:
-            lines.append(f"- {r['id']}: {r['message']} (in {r['time_until']}) — by {r['user']}")
+            lines.append(f"- {r['id']}: {r['message']} (in {r['time_until']}) -- by {r['user']}")
         return "\n".join(lines)
     elif name == "cancel_reminder":
         try:
@@ -182,4 +187,3 @@ async def execute_timer_tool(name: str, args: dict):
         except ValueError as e:
             return str(e)
     return f"Unknown timer tool: {name}"
-

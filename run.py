@@ -34,7 +34,14 @@ mcp_transports: dict[str, contextlib.AsyncExitStack] = {}
 
 async def _execute_add_reminder(args):
     engine = get_engine()
-    result = await engine.add_reminder(args["channel_id"], args["user"], args["message"], args["delay_minutes"])
+    channel_id = args.get("channel_id", 0)
+    user_str = args["user"]
+    user_id = 0
+    if user_str.startswith("<@") or user_str.startswith("<@!"):
+        user_id = int(user_str.strip("<>@!>"))
+    elif user_str.isdigit():
+        user_id = int(user_str)
+    result = await engine.add_reminder(channel_id, user_str, args["message"], args["delay_minutes"], user_id)
     return f"Reminder set: {result['message']} in {result['time_until']} (ID: {result['id']})"
 
 async def _execute_list_reminders(args):
@@ -48,9 +55,23 @@ async def _execute_list_reminders(args):
     return "\n".join(lines)
 
 async def _fire_reminder_callback(reminder):
-    channel = client.get_channel(reminder.channel_id)
-    if channel:
-        await channel.send(f"Reminder: {reminder.user} — {reminder.message}")
+    logger.info(f"Reminder fired callback triggered: id={reminder.id}, channel_id={reminder.channel_id}, user={reminder.user}, user_id={reminder.user_id}, message={reminder.message!r}")
+    if reminder.channel_id:
+        channel = client.get_channel(reminder.channel_id)
+        if channel:
+            logger.info(f"Sending reminder to channel {reminder.channel_id}: {reminder.message!r}")
+            await channel.send(f"Reminder: {reminder.user} — {reminder.message}")
+        else:
+            logger.error(f"Channel {reminder.channel_id} not found")
+    else:
+        logger.info(f"Sending DM reminder to user_id {reminder.user_id}: {reminder.message!r}")
+        try:
+            user = await client.fetch_user(reminder.user_id)
+            logger.info(f"Fetched user: {user.name} (ID: {user.id})")
+            await user.send(f"Reminder: {reminder.message}")
+            logger.info(f"DM sent successfully to {user.name}")
+        except Exception as e:
+            logger.error(f"Failed to DM reminder to {reminder.user} (user_id={reminder.user_id}): {e}")
 
 
 async def _execute_cancel_reminder(args):
@@ -67,16 +88,17 @@ local_timer_tools = [
         "function": {
             "name": "add_reminder",
             "description": "Start a timer/reminder. channel_id (int), user (@mention), message (str), delay_minutes (float).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "channel_id": {"type": "integer", "description": "Discord channel ID where reminder will fire"},
-                    "user": {"type": "string", "description": "User mention string (e.g. @username)"},
-                    "message": {"type": "string", "description": "What to remind about, e.g. 'drink water'"},
-                    "delay_minutes": {"type": "number", "description": "Minutes from now until the reminder fires"},
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "channel_id": {"type": "integer", "description": "Discord channel ID where reminder will fire (use 0 for personal/DM reminder)"},
+                        "user": {"type": "string", "description": "User mention string (e.g. @username)"},
+                        "user_id": {"type": "integer", "description": "Discord user ID of the person to remind (used for DM when channel_id is 0)"},
+                        "message": {"type": "string", "description": "What to remind about, e.g. 'drink water'"},
+                        "delay_minutes": {"type": "number", "description": "Minutes from now until the reminder fires"},
+                    },
+                    "required": ["user", "message", "delay_minutes"],
                 },
-                "required": ["channel_id", "user", "message", "delay_minutes"],
-            },
         },
     },
     {
