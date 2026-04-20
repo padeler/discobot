@@ -1,6 +1,6 @@
 # Simple Discord AI
 
-An AI chatbot for Discord that integrates with Ollama for local LLM inference. It supports direct mentions and auto-response channel participation.
+An AI chatbot for Discord that integrates with Ollama for local LLM inference. It supports direct mentions, auto-response channel participation, reminders, and MCP-based tool use.
 
 The bot receives messages and places them in a queue. A background loop runs at a configurable interval and processes all queued messages. Messages are stored in per-channel history with timestamps and usernames. The bot is aware of the current date and time. All actions are logged at the configured level. Configuration is stored in `config.yaml`.
 

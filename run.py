@@ -15,6 +15,8 @@ from dotenv import load_dotenv
 import contextlib
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
+from skills import registry, triggers
+from skills.timer_engine import get_engine
 
 load_dotenv()
 
@@ -27,12 +29,102 @@ mcp_tools = []
 mcp_sessions: dict[str, ClientSession] = {}
 mcp_transports: dict[str, contextlib.AsyncExitStack] = {}
 
+# Local timer tools (non-MCP)
+# (defined after functions below)
+
+async def _execute_add_reminder(args):
+    engine = get_engine()
+    result = await engine.add_reminder(args["channel_id"], args["user"], args["message"], args["delay_minutes"])
+    return f"Reminder set: {result['message']} in {result['time_until']} (ID: {result['id']})"
+
+async def _execute_list_reminders(args):
+    engine = get_engine()
+    reminders = await engine.list_reminders(args.get("channel_id"))
+    if not reminders:
+        return "No pending reminders."
+    lines = ["## Pending Reminders"]
+    for r in reminders:
+        lines.append(f"- {r['id']}: {r['message']} (in {r['time_until']}) — by {r['user']}")
+    return "\n".join(lines)
+
+async def _fire_reminder_callback(reminder):
+    channel = client.get_channel(reminder.channel_id)
+    if channel:
+        await channel.send(f"Reminder: {reminder.user} — {reminder.message}")
+
+
+async def _execute_cancel_reminder(args):
+    engine = get_engine()
+    try:
+        r = await engine.cancel_reminder(args["reminder_id"])
+        return f"Cancelled: {r['message']} (ID: {r['id']})"
+    except ValueError as e:
+        return str(e)
+
+local_timer_tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "add_reminder",
+            "description": "Start a timer/reminder. channel_id (int), user (@mention), message (str), delay_minutes (float).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel_id": {"type": "integer", "description": "Discord channel ID where reminder will fire"},
+                    "user": {"type": "string", "description": "User mention string (e.g. @username)"},
+                    "message": {"type": "string", "description": "What to remind about, e.g. 'drink water'"},
+                    "delay_minutes": {"type": "number", "description": "Minutes from now until the reminder fires"},
+                },
+                "required": ["channel_id", "user", "message", "delay_minutes"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_reminders",
+            "description": "List all pending reminders. Optional channel_id to filter.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel_id": {"type": "integer", "description": "Optional: filter to specific channel"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_reminder",
+            "description": "Cancel a pending reminder by its ID.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reminder_id": {"type": "string", "description": "The reminder ID to cancel"},
+                },
+                "required": ["reminder_id"],
+            },
+        },
+    },
+]
+
+_timer_tools = {
+    "add_reminder": _execute_add_reminder,
+    "list_reminders": _execute_list_reminders,
+    "cancel_reminder": _execute_cancel_reminder,
+}
+
 def load_config():
     with open("config.yaml", "r") as f:
         return yaml.safe_load(f)
 
 
 config = load_config()
+
+skills_registry = registry.get_registry()
+skill_threshold = config.get("skills", {}).get("trigger_threshold", 0.3)
+active_skills: dict[int, list[dict]] = defaultdict(list)
 
 logging.basicConfig(
     level=getattr(logging, config["logging"]["level"].upper()),
@@ -87,6 +179,70 @@ def cleanup_history(guild_id: int, channel_id: int) -> None:
     if history[key] != msgs:
         save_history(guild_id, channel_id)
         logger.debug(f"Cleaned up history for {guild_id}_{channel_id}")
+
+
+def update_skills(channel_id: int, content: str, is_mention: bool) -> bool:
+    new_skills = []
+    if is_mention:
+        active_skills[channel_id] = []
+        return True
+
+    matches = triggers.match_skill(content, skills_registry, skill_threshold)
+    for match in matches:
+        skill_name = match["skill_name"]
+        skill = skills_registry.get_skill(skill_name)
+        if skill:
+            new_skills.append({"name": skill_name, "body": skill.body})
+
+    active_skills[channel_id] = new_skills
+    return bool(matches)
+
+
+def build_skill_injection(skills: list[dict]) -> str | None:
+    if not skills:
+        return None
+    parts = []
+    for skill in skills:
+        parts.append(f"\n### {skill['name'].upper()} SKILL:\n{skill['body']}")
+    return "\n".join(parts)
+
+
+def create_skill_command(skill_name: str):
+    async def cmd(interaction: discord.Interaction):
+        skill = skills_registry.get_skill(skill_name)
+        if skill:
+            active_skills[interaction.channel_id] = [{"name": skill_name, "body": skill.body}]
+            await interaction.response.send_message(f"Skill `{skill_name}` activated. What would you like to do?", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"Skill '{skill_name}' not found", ephemeral=True)
+    return cmd
+
+
+def build_prompt(channel_id: int, messages: list[dict]) -> list[dict]:
+    msgs = []
+    if config["preprompt"]["enabled"]:
+        msgs.append({"role": "system", "content": config["preprompt"]["system"]})
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    msgs.append({"role": "system", "content": f"Current date/time: {now}"})
+
+    skill_content = build_skill_injection(active_skills.get(channel_id, []))
+    if skill_content:
+        msgs.append({"role": "system", "content": f"You have active skills:{skill_content}"})
+
+    if mcp_tools:
+        tool_names = ", ".join(t["function"]["name"] for t in mcp_tools)
+        msgs.append(
+            {
+                "role": "system",
+                "content": f"You have access to web tools: {tool_names}. Use them when you need current information from the internet.",
+            }
+        )
+
+    for m in messages:
+        msgs.append({"role": m["role"], "content": m["content"]})
+
+    return msgs
 
 
 async def setup_mcp():
@@ -155,10 +311,23 @@ async def setup_mcp():
         except Exception as e:
             logger.error(f"Failed to start MCP server '{name}': {e}")
 
-    logger.info(f"Total MCP tools available: {len(mcp_tools)}")
+    # Merge local timer tools
+    mcp_tools = local_timer_tools + mcp_tools
+    logger.info(f"Total tools available: {len(mcp_tools)} (including {len(local_timer_tools)} local timer tools)")
+
+    # Start timer engine
+    engine = get_engine()
+    await engine.load()
+    engine.set_fire_callback(_fire_reminder_callback)
+    engine.start_monitor()
 
 
 async def execute_mcp_tool(tool_name: str, arguments: dict) -> str:
+    # Check local timer tools first before MCP servers
+    for timer_tool in local_timer_tools:
+                if timer_tool["function"]["name"] == tool_name:
+                    return await _timer_tools[tool_name](arguments)
+
     # Find which server owns this tool by checking all sessions
     for server_name, session in mcp_sessions.items():
         try:
@@ -211,6 +380,8 @@ async def call_ollama(messages: list[dict]) -> str:
                 func = tool_call.get("function", {})
                 name = func.get("name", "")
                 args_str = func.get("arguments", "{}")
+                if args_str is None:
+                    args_str = "{}"
                 if isinstance(args_str, str):
                     args = json.loads(args_str)
                 else:
@@ -240,33 +411,17 @@ async def call_ollama(messages: list[dict]) -> str:
     return "Error: exceeded maximum tool calls"
 
 
-def build_prompt(messages: list[dict]) -> list[dict]:
-    msgs = []
-    if config["preprompt"]["enabled"]:
-        msgs.append({"role": "system", "content": config["preprompt"]["system"]})
-
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    msgs.append({"role": "system", "content": f"Current date/time: {now}"})
-
-    if mcp_tools:
-        tool_names = ", ".join(t["function"]["name"] for t in mcp_tools)
-        msgs.append(
-            {
-                "role": "system",
-                "content": f"You have access to web tools: {tool_names}. Use them when you need current information from the internet.",
-            }
-        )
-
-    for m in messages:
-        msgs.append({"role": m["role"], "content": m["content"]})
-
-    return msgs
-
-
 async def process_message(
-    guild_id: int, channel_id: int, content: str, author: str
+    guild_id: int, channel_id: int, content: str, author: str, is_mention: bool
 ) -> None:
     key = f"{guild_id}_{channel_id}"
+
+    update_skills(channel_id, content, is_mention)
+
+    if not is_mention:
+        matched = any(m["confidence"] > 0.5 for m in triggers.match_skill(content, skills_registry, skill_threshold))
+        if matched:
+            logger.info(f"Active skills for {channel_id}: {[s['name'] for s in active_skills.get(channel_id, [])]}")
     channel = client.get_channel(channel_id)
     if not channel:
         logger.warning(f"Channel {channel_id} not found")
@@ -283,7 +438,7 @@ async def process_message(
         }
     )
 
-    prompt = build_prompt(history[key])
+    prompt = build_prompt(channel_id, history[key])
     logger.debug(f"Prompt: {prompt}")
 
     try:
@@ -370,12 +525,12 @@ async def message_processor():
                 active_users[channel_id][author] = datetime.now()
 
                 if is_mention:
-                    await process_message(guild_id, channel_id, content, author)
+                    await process_message(guild_id, channel_id, content, author, is_mention)
                 elif config["channel"]["enabled"]:
                     if await evaluate_should_respond(
                         guild_id, channel_id, content, author
                     ):
-                        await process_message(guild_id, channel_id, content, author)
+                        await process_message(guild_id, channel_id, content, author, is_mention)
                     else:
                         history[f"{guild_id}_{channel_id}"].append(
                             {
@@ -393,7 +548,13 @@ async def message_processor():
 @client.event
 async def on_ready():
     logger.info(f"Logged in as {client.user} (ID: {client.user.id})")
-    # Sync commands globally - this may take a few minutes to propagate in Discord
+    skills_registry.load_all()
+    for cmd_name in skills_registry.get_all_names():
+        skill = skills_registry.get_skill(cmd_name) if skills_registry.get_skill(cmd_name) else None
+        desc = skill.description if skill and len(skill.description) <= 100 else "Use this skill for related tasks."
+        cmd = app_commands.Command(name=cmd_name, description=desc, callback=create_skill_command(cmd_name))
+        tree.add_command(cmd)
+        logger.info(f"Registered skill command: /{cmd_name}")
     synced = await tree.sync()
     logger.info(f"Synced {len(synced)} commands globally")
     for cmd in synced:
@@ -416,6 +577,9 @@ async def on_disconnect():
 @client.event
 async def on_message(message):
     if message.author == client.user:
+        return
+
+    if client.user is None:
         return
 
     is_mention = client.user.mentioned_in(message)
@@ -494,6 +658,20 @@ async def set_min_length_command(interaction: discord.Interaction, length: int):
     await interaction.response.send_message(
         f"Minimum message length set to {length} characters!", ephemeral=True
     )
+
+
+@tree.command(name="skills", description="List all available skills")
+async def skills_command(interaction: discord.Interaction):
+    skill_list = []
+    for name, skill in skills_registry.get_all_descriptions().items():
+        if len(skill) > 1000:
+            skill = skill[:997] + "..."
+        skill_list.append(f"- `{name}`: {skill}")
+    embed = discord.Embed(title="Available Skills", color=discord.Color.blue())
+    for i in range(0, len(skill_list), 10):
+        chunk = "\n".join(skill_list[i:i+10])
+        embed.add_field(name="", value=chunk, inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @tree.command(name="show_preprompt", description="Show the current preprompt")
