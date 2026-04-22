@@ -1,8 +1,9 @@
 """Memory engine - stores and recalls arbitrary facts and notes."""
 
-import asyncio
 import json
 import logging
+import re
+import unicodedata
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -41,8 +42,6 @@ class Memory:
 
 
 def _normalize(text: str) -> str:
-    import re
-    import unicodedata
     text = text.lower()
     text = unicodedata.normalize("NFKD", text)
     text = "".join(c for c in text if not unicodedata.combining(c))
@@ -122,8 +121,18 @@ class MemoryEngine:
         logger.info("Memory stored: '%s' in channel %d", content, channel_id)
         return m.to_dict()
 
-    async def search(self, query: str, threshold: float = 0.0) -> list[dict]:
+    async def search(
+        self,
+        query: str,
+        threshold: float = 0.0,
+        channel_id: Optional[int] = None,
+        user: Optional[str] = None,
+    ) -> list[dict]:
         items = [m.to_dict() for m in self.memories]
+        if channel_id is not None:
+            items = [m for m in items if m["channel_id"] == channel_id]
+        if user is not None:
+            items = [m for m in items if m["user"] == user]
         results = _keyword_search(query, items, threshold)
         logger.info("Memory search for '%s' returned %d results", query, len(results))
         return results
@@ -224,19 +233,19 @@ async def execute_tool(name: str, args: dict, author_id: int = 0) -> str:
                 return "I don't remember anything yet."
             lines = ["## What I remember:"]
             for m in memories:
-                lines.append(f"- {m['content']} (by {m['user']})")
+                lines.append(f"- {m['content']} (ID: {m['id']}, by {m['user']})")
             return "\n".join(lines)
         results = await engine.search(query)
         if not results:
             return f"I couldn't find any memories matching \"{query}\"."
         lines = [f"### Found {len(results)} memory(s):"]
         for m in results:
-            lines.append(f"- {m['content']} (by {m['user']})")
+            lines.append(f"- {m['content']} (ID: {m['id']}, by {m['user']})")
         return "\n".join(lines)
     elif name == "forget_memory":
         try:
             m = await engine.delete(args["memory_id"])
-            return f"Forgetten: \"{m['content']}\" (ID: {m['id']})"
+            return f"Forgotten: \"{m['content']}\" (ID: {m['id']})"
         except ValueError as e:
             return str(e)
     return f"Unknown memory tool: {name}"
