@@ -14,7 +14,7 @@ import contextlib
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 from engine import registry, triggers
-from engine.timer_engine import get_engine
+from engine.timer_engine import get_engine, get_tools, execute_timer_tool
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -26,46 +26,10 @@ mcp_tools = []
 mcp_sessions: dict[str, ClientSession] = {}
 mcp_transports: dict[str, contextlib.AsyncExitStack] = {}
 
-# Local timer tools (non-MCP)
-# (defined after functions below)
-
 # Context for the current message being processed
 _current_author_id: int = 0
 
-async def _execute_add_reminder(args):
-    engine = get_engine()
-    channel_id = args.get("channel_id", 0)
-    user_str = args["user"]
-    message_author_id = args.get("message_author_id", 0)
-    
-    if user_str.startswith("<@") or user_str.startswith("<@!"):
-        user_id = int(user_str.strip("<>@!>"))
-    elif user_str.isdigit():
-        user_id = int(user_str)
-    else:
-        user_id = message_author_id
-    
-    # If user_id is still 0 (Llama didn't parse the mention or sent user_id=0), fall back to message_author_id
-    if not user_id and message_author_id:
-        user_id = message_author_id
-    elif not user_id:
-        user_id = channel_id
-    
-    result = await engine.add_reminder(channel_id, user_str, args["message"], args["delay_minutes"], user_id)
-    return f"Reminder set: {result['message']} in {result['time_until']} (ID: {result['id']})"
-
-async def _execute_list_reminders(args):
-    engine = get_engine()
-    reminders = await engine.list_reminders(args.get("channel_id"))
-    if not reminders:
-        return "No pending reminders."
-    lines = ["## Pending Reminders"]
-    for r in reminders:
-        lines.append(f"- {r['id']}: {r['message']} (in {r['time_until']}) — by {r['user']}")
-    return "\n".join(lines)
-
 async def _fire_reminder_callback(reminder):
-    logger.info(f"Reminder fired callback triggered: id={reminder.id}, channel_id={reminder.channel_id}, user={reminder.user}, user_id={reminder.user_id}, message={reminder.message!r}")
     if reminder.channel_id:
         channel = client.get_channel(reminder.channel_id)
         if channel:
@@ -74,78 +38,12 @@ async def _fire_reminder_callback(reminder):
         else:
             logger.error(f"Channel {reminder.channel_id} not found")
     else:
-        logger.info(f"Sending DM reminder to user_id {reminder.user_id}: {reminder.message!r}")
         try:
             user = await client.fetch_user(reminder.user_id)
-            logger.info(f"Fetched user: {user.name} (ID: {user.id})")
             await user.send(f"Reminder: {reminder.message}")
-            logger.info(f"DM sent successfully to {user.name}")
+            logger.info(f"DM reminder sent to {user.name}")
         except Exception as e:
             logger.error(f"Failed to DM reminder to {reminder.user} (user_id={reminder.user_id}): {e}")
-
-
-async def _execute_cancel_reminder(args):
-    engine = get_engine()
-    try:
-        r = await engine.cancel_reminder(args["reminder_id"])
-        return f"Cancelled: {r['message']} (ID: {r['id']})"
-    except ValueError as e:
-        return str(e)
-
-local_timer_tools = [
-    {
-        "type": "function",
-        "function": {
-            "name": "add_reminder",
-            "description": "Start a timer/reminder. channel_id (int), user (@mention), message (str), delay_minutes (float).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "channel_id": {"type": "integer", "description": "Discord channel ID where reminder will fire (use 0 for personal/DM reminder)"},
-                        "user": {"type": "string", "description": "User mention string (e.g. @username)"},
-                        "user_id": {"type": "integer", "description": "Discord user ID of the person to remind (used for DM when channel_id is 0)"},
-                        "message": {"type": "string", "description": "What to remind about, e.g. 'drink water'"},
-                        "delay_minutes": {"type": "number", "description": "Minutes from now until the reminder fires"},
-                    },
-                    "required": ["user", "message", "delay_minutes"],
-                },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_reminders",
-            "description": "List all pending reminders. Optional channel_id to filter.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "channel_id": {"type": "integer", "description": "Optional: filter to specific channel"},
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "cancel_reminder",
-            "description": "Cancel a pending reminder by its ID.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "reminder_id": {"type": "string", "description": "The reminder ID to cancel"},
-                },
-                "required": ["reminder_id"],
-            },
-        },
-    },
-]
-
-_timer_tools = {
-    "add_reminder": _execute_add_reminder,
-    "list_reminders": _execute_list_reminders,
-    "cancel_reminder": _execute_cancel_reminder,
-}
 
 def load_config():
     with open("config.yaml", "r") as f:
@@ -350,9 +248,10 @@ async def setup_mcp():
         except Exception as e:
             logger.error(f"Failed to start MCP server '{name}': {e}")
 
-    # Merge local timer tools
-    mcp_tools = local_timer_tools + mcp_tools
-    logger.info(f"Total tools available: {len(mcp_tools)} (including {len(local_timer_tools)} local timer tools)")
+    # Add timer tools
+    timer_tools = get_tools()
+    mcp_tools = timer_tools + mcp_tools
+    logger.info(f"Total tools available: {len(mcp_tools)} (including {len(timer_tools)} timer tools)")
 
     # Start timer engine
     engine = get_engine()
@@ -362,20 +261,20 @@ async def setup_mcp():
 
 
 async def execute_mcp_tool(tool_name: str, arguments: dict, author_id: int = 0) -> str:
-    # Check local timer tools first before MCP servers
-    for timer_tool in local_timer_tools:
-                if timer_tool["function"]["name"] == tool_name:
-                    arguments["message_author_id"] = author_id
-                    return await _timer_tools[tool_name](arguments)
+    # Dispatch to timer engine first (handles add/list/cancel_reminder)
+    if tool_name in ("add_reminder", "list_reminders", "cancel_reminder"):
+        # Ensure channel_id has a default so the LLM doesn't need to provide it
+        arguments.setdefault("channel_id", 0)
+        arguments["message_author_id"] = author_id
+        return await execute_timer_tool(tool_name, arguments)
 
-    # Find which server owns this tool by checking all sessions
+    # Find which MCP server owns this tool
     for server_name, session in mcp_sessions.items():
         try:
             tools_result = await session.list_tools()
             for tool in tools_result.tools:
                 if tool.name == tool_name:
                     result = await session.call_tool(tool_name, arguments)
-                    # Convert result to string
                     parts = []
                     for content in result.content:
                         if isinstance(content, types.TextContent):
