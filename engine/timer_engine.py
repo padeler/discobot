@@ -142,6 +142,12 @@ class TimerEngine:
     def start_monitor(self):
         self._monitor_task = asyncio.ensure_future(self._monitor_loop())
 
+    def stop_monitor(self) -> None:
+        """Cancel the monitor task so the process can exit."""
+        if self._monitor_task and not self._monitor_task.done():
+            self._monitor_task.cancel()
+            logger.info("Timer monitor cancelled")
+
     async def _monitor_loop(self):
         while True:
             try:
@@ -165,6 +171,7 @@ def get_engine():
 
 
 def get_tools_as_string() -> str:
+    """Return timer tool definitions as a JSON string (for backward compatibility)."""
     return json.dumps([
         {
             "name": "add_reminder",
@@ -233,7 +240,7 @@ def get_tools() -> list:
     ]
 
 
-async def execute_timer_tool(name: str, args: dict):
+async def execute_timer_tool(name: str, args: dict) -> str:
     engine = get_engine()
     if name == "add_reminder":
         result = await engine.add_reminder(

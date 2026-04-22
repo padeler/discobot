@@ -1,18 +1,22 @@
+"""Discord AI chatbot with Ollama LLM integration."""
+
 import asyncio
 import json
 import logging
 import os
+import signal
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Optional
 import discord
 import requests
 import yaml
 from discord import app_commands
 from dotenv import load_dotenv
-import contextlib
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
+import contextlib
 from engine import registry, triggers
 from engine.timer_engine import get_engine, get_tools, execute_timer_tool
 load_dotenv()
@@ -20,7 +24,7 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
 # MCP tool definitions (populated at startup)
-mcp_tools = []
+mcp_tools: list[dict] = []
 
 # Active MCP client sessions and transports, keyed by server name
 mcp_sessions: dict[str, ClientSession] = {}
@@ -45,12 +49,14 @@ async def _fire_reminder_callback(reminder):
         except Exception as e:
             logger.error(f"Failed to DM reminder to {reminder.user} (user_id={reminder.user_id}): {e}")
 
-def load_config():
+def load_config() -> dict:
+    """Load configuration from config.yaml."""
     with open("config.yaml", "r") as f:
         return yaml.safe_load(f)
 
 
-def save_config():
+def save_config() -> None:
+    """Save current config dict to config.yaml."""
     with open("config.yaml", "w") as f:
         yaml.dump(config, f)
 
@@ -78,6 +84,7 @@ tree = app_commands.CommandTree(client)
 
 history: dict[str, list[dict]] = defaultdict(list)
 active_users: dict[int, dict[str, datetime]] = defaultdict(dict)
+history: dict[str, list[dict]] = defaultdict(list)
 
 HISTORY_DIR = Path("data/history")
 HISTORY_DIR.mkdir(parents=True, exist_ok=True)
@@ -99,6 +106,7 @@ def save_history(guild_id: int, channel_id: int) -> None:
 
 
 def cleanup_history(guild_id: int, channel_id: int) -> None:
+    """Remove expired and excess messages from channel history."""
     key = f"{guild_id}_{channel_id}"
     max_msgs = config["history"]["max_messages"]
     window = config["conversation"]["window_minutes"]
@@ -112,16 +120,17 @@ def cleanup_history(guild_id: int, channel_id: int) -> None:
 
     if history[key] != msgs:
         save_history(guild_id, channel_id)
-        logger.debug(f"Cleaned up history for {guild_id}_{channel_id}")
+        logger.debug("Cleaned up history for %s", key)
 
 
 def update_skills(channel_id: int, content: str, is_mention: bool) -> bool:
-    new_skills = []
+    """Update active skills for a channel. Resets skills on mention."""
     if is_mention:
         active_skills[channel_id] = []
         return True
 
     matches = triggers.match_skill(content, skills_registry, skill_threshold)
+    new_skills = []
     for match in matches:
         skill_name = match["skill_name"]
         skill = skills_registry.get_skill(skill_name)
@@ -133,6 +142,7 @@ def update_skills(channel_id: int, content: str, is_mention: bool) -> bool:
 
 
 def build_skill_injection(skills: list[dict]) -> str | None:
+    """Format active skills as a string for injection into the prompt."""
     if not skills:
         return None
     parts = []
@@ -142,17 +152,24 @@ def build_skill_injection(skills: list[dict]) -> str | None:
 
 
 def create_skill_command(skill_name: str):
+    """Create a slash command callback for activating a skill."""
     async def cmd(interaction: discord.Interaction):
         skill = skills_registry.get_skill(skill_name)
         if skill:
             active_skills[interaction.channel_id] = [{"name": skill_name, "body": skill.body}]
-            await interaction.response.send_message(f"Skill `{skill_name}` activated. What would you like to do?", ephemeral=True)
+            await interaction.response.send_message(
+                f"Skill `{skill_name}` activated. What would you like to do?",
+                ephemeral=True,
+            )
         else:
-            await interaction.response.send_message(f"Skill '{skill_name}' not found", ephemeral=True)
+            await interaction.response.send_message(
+                f"Skill '{skill_name}' not found", ephemeral=True
+            )
     return cmd
 
 
 def build_prompt(channel_id: int, messages: list[dict], author_id: int) -> list[dict]:
+    """Build the full prompt with system messages, skills, and chat history."""
     msgs = []
     if config["preprompt"]["enabled"]:
         msgs.append({"role": "system", "content": config["preprompt"]["system"]})
@@ -182,7 +199,8 @@ def build_prompt(channel_id: int, messages: list[dict], author_id: int) -> list[
     return msgs
 
 
-async def setup_mcp():
+async def setup_mcp() -> None:
+    """Initialize MCP servers and timer engine tools."""
     global mcp_tools
     mcp_config = config.get("mcp", {})
     if not mcp_config.get("enabled", False):
@@ -261,6 +279,7 @@ async def setup_mcp():
 
 
 async def execute_mcp_tool(tool_name: str, arguments: dict, author_id: int = 0) -> str:
+    """Execute an MCP tool call, dispatching to the correct server or timer engine."""
     # Dispatch to timer engine first (handles add/list/cancel_reminder)
     if tool_name in ("add_reminder", "list_reminders", "cancel_reminder"):
         # Ensure channel_id has a default so the LLM doesn't need to provide it
@@ -291,6 +310,7 @@ async def execute_mcp_tool(tool_name: str, arguments: dict, author_id: int = 0) 
     return f"Error: tool '{tool_name}' not found on any MCP server"
 
 async def call_ollama(messages: list[dict]) -> str:
+    """Call the Ollama API with tool calling support, handling multi-turn tool use."""
     url = config["ollama"]["api_url"]
     payload = {
         "model": config["ollama"]["model"],
@@ -353,6 +373,7 @@ async def call_ollama(messages: list[dict]) -> str:
 async def process_message(
     guild_id: int, channel_id: int, content: str, author: str, is_mention: bool, author_id: int = 0
 ) -> None:
+    """Process a message: update skills, append to history, call LLM, and reply."""
     key = f"{guild_id}_{channel_id}"
 
     update_skills(channel_id, content, is_mention)
@@ -360,10 +381,11 @@ async def process_message(
     if not is_mention:
         matched = any(m["confidence"] > 0.5 for m in triggers.match_skill(content, skills_registry, skill_threshold))
         if matched:
-            logger.info(f"Active skills for {channel_id}: {[s['name'] for s in active_skills.get(channel_id, [])]}")
+            logger.info("Active skills for %d: %s", channel_id, [s["name"] for s in active_skills.get(channel_id, [])])
+
     channel = client.get_channel(channel_id)
     if not channel:
-        logger.warning(f"Channel {channel_id} not found")
+        logger.warning("Channel %d not found", channel_id)
         return
 
     cleanup_history(guild_id, channel_id)
@@ -379,14 +401,14 @@ async def process_message(
     )
 
     prompt = build_prompt(channel_id, history[key], author_id)
-    logger.debug(f"Prompt: {prompt}")
+    logger.debug("Prompt: %s", prompt)
 
     try:
         global _current_author_id
         _current_author_id = author_id
         async with channel.typing():
             response = await call_ollama(prompt)
-            logger.info(f"Response: {response}")
+            logger.info("Response: %s", response)
 
         history[key].append(
             {
@@ -400,23 +422,23 @@ async def process_message(
 
         await channel.send(response)
     except Exception as e:
-        logger.error(f"Error processing message: {e}")
+        logger.error("Error processing message: %s", e)
 
 
 async def evaluate_should_respond(
     guild_id: int, channel_id: int, content: str, author: str
 ) -> bool:
+    """Decide whether the bot should auto-respond to a channel message."""
     if len(content) < config["channel"]["min_message_length"]:
         return False
 
-    key = f"{guild_id}_{channel_id}"
     recent_users = active_users.get(channel_id, {})
     if author in recent_users:
         last_seen = recent_users[author]
         if datetime.now() - last_seen < timedelta(
             minutes=config["conversation"]["window_minutes"]
         ):
-            logger.debug(f"Active user {author} in channel {channel_id}, responding")
+            logger.debug("Active user %s in channel %d, responding", author, channel_id)
             return True
 
     eval_prompt = [
@@ -427,21 +449,21 @@ async def evaluate_should_respond(
         },
         {
             "role": "user",
-            "content": f"""Evaluate if the bot should respond to this message:
-
-"{content}"
-
-Respond with ONLY "YES" or "NO.""",
+            "content": (
+                f'Evaluate if the bot should respond to this message:\n\n'
+                f'"{content}"\n\n'
+                f'Respond with ONLY "YES" or "NO."'
+            ),
         },
     ]
 
     try:
         result = await call_ollama(eval_prompt)
         should_respond = result.strip().upper().startswith("YES")
-        logger.debug(f"Auto-response evaluation: {should_respond}")
+        logger.debug("Auto-response evaluation: %s", should_respond)
         return should_respond
     except Exception as e:
-        logger.error(f"Error evaluating response: {e}")
+        logger.error("Error evaluating response: %s", e)
         return False
 
 
@@ -450,7 +472,7 @@ async def on_ready():
     logger.info(f"Logged in as {client.user} (ID: {client.user.id})")
     skills_registry.load_all()
     for cmd_name in skills_registry.get_all_names():
-        skill = skills_registry.get_skill(cmd_name) if skills_registry.get_skill(cmd_name) else None
+        skill = skills_registry.get_skill(cmd_name)
         desc = skill.description if skill and len(skill.description) <= 100 else "Use this skill for related tasks."
         cmd = app_commands.Command(name=cmd_name, description=desc, callback=create_skill_command(cmd_name))
         tree.add_command(cmd)
@@ -496,9 +518,6 @@ async def on_message(message):
     if not content:
         return
 
-    if not content:
-        return
-
     guild_id = message.guild.id if message.guild else 0
     key = f"{guild_id}_{message.channel.id}"
     active_users[message.channel.id][message.author.name] = datetime.now()
@@ -507,7 +526,7 @@ async def on_message(message):
         await process_message(guild_id, message.channel.id, content, message.author.name, is_mention, message.author.id)
     elif config["channel"]["enabled"]:
         if await evaluate_should_respond(guild_id, message.channel.id, content, message.author.name):
-            await process_message(guild_id, message.channel.id, content, message.author.name, is_mention, message.author.id)
+            await process_message(guild_id, message.channel.id, content, message.author.name, False, message.author.id)
         else:
             history[key].append(
                 {
@@ -627,12 +646,14 @@ async def set_preprompt_command(interaction: discord.Interaction, preprompt: str
 
 
 async def main():
+    """Start the bot: initialize MCP, start reminder monitor, and connect to Discord."""
     await setup_mcp()
     asyncio.create_task(_start_reminder_monitor())
     await client.start(DISCORD_TOKEN)
 
 
 async def _start_reminder_monitor():
+    """Start the timer engine's reminder monitor after a short delay."""
     await asyncio.sleep(1)
     engine = get_engine()
     await engine.load()
@@ -640,5 +661,29 @@ async def _start_reminder_monitor():
     engine.start_monitor()
 
 
+def _on_shutdown(loop: asyncio.AbstractEventLoop):
+    """Signal handler callback to gracefully shut down the bot."""
+    logger.info("Shutdown signal received, stopping bot...")
+    loop.call_soon_threadsafe(loop.stop)
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, _on_shutdown, loop)
+
+    try:
+        loop.run_until_complete(main())
+    except BaseException as e:
+        # CancelledError (from Ctrl-C) is BaseException, not Exception
+        if not isinstance(e, asyncio.CancelledError | KeyboardInterrupt):
+            logger.exception("Unhandled error in main loop")
+    finally:
+        # Cancel timer monitor so the event loop can close
+        engine = get_engine()
+        engine.stop_monitor()
+        loop.run_until_complete(client.close())
+        loop.close()
+        logger.info("Bot shut down complete")

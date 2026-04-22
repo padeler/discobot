@@ -4,4 +4,4 @@ Provides markdown-based skills compatible with the Agent Skills spec
 (Claude Code / Cursor / Gemini CLI compatible).
 """
 
-__all__ = ["parser", "registry", "triggers"]
+__all__ = ["parser", "registry", "timer_engine", "triggers"]

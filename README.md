@@ -35,7 +35,7 @@ The bot receives messages and places them in a queue. A background loop runs at 
 ## Slash Commands
 
 | Command | Description |
-|---------|-------------|
+|---------|---------|
 | `/status` | Show bot model, latency, auto-response status, and conversation window |
 | `/clear_history` | Clear conversation history for the current channel |
 | `/set_min_length <n>` | Set the minimum message length (in characters) for auto-response. Persists to `config.yaml` |

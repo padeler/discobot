@@ -22,8 +22,8 @@ def _normalize(text: str) -> str:
     return text
 
 
-def extract_keywords(text: str, threshold: float = 0.5) -> set[str]:
-    """Extract meaningful keywords from text for matching."""
+def extract_keywords(text: str) -> set[str]:
+    """Extract meaningful keywords from text for skill matching."""
     normalized = _normalize(text)
     tokens = normalized.split()
     stop_words = {
@@ -39,7 +39,6 @@ def extract_keywords(text: str, threshold: float = 0.5) -> set[str]:
         "who", "whom", "when", "where", "why", "how", "my", "your", "his",
         "her", "our", "their", "me", "you", "him", "we", "they", "am",
     }
-    # Keep tokens that are >= 3 chars and not in stop words
     kept = [t for t in tokens if len(t) >= 3 and t not in stop_words]
     return set(kept)
 
@@ -75,7 +74,7 @@ def match_skill(message: str, registry: SkillsRegistry, threshold: float = DEFAU
     if not message:
         return []
 
-    query_keywords = extract_keywords(message, threshold=0.5)
+    query_keywords = extract_keywords(message)
     if not query_keywords:
         return []
 

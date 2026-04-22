@@ -1,4 +1,4 @@
-# Defining curstom ollama models 
+# Defining custom Ollama models 
 
 ## Modelfiles
 
