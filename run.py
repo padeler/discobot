@@ -18,7 +18,8 @@ from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 import contextlib
 from engine import registry, triggers
-from engine.timer_engine import get_engine, get_tools, execute_timer_tool
+from engine.timer_engine import get_engine as get_timer_engine, get_tools as timer_get_tools, execute_timer_tool
+from engine.memory_engine import get_engine as get_memory_engine, get_tools as memory_get_tools, execute_tool as execute_memory_tool
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -267,15 +268,24 @@ async def setup_mcp() -> None:
             logger.error(f"Failed to start MCP server '{name}': {e}")
 
     # Add timer tools
-    timer_tools = get_tools()
+    timer_tools = timer_get_tools()
     mcp_tools = timer_tools + mcp_tools
     logger.info(f"Total tools available: {len(mcp_tools)} (including {len(timer_tools)} timer tools)")
 
     # Start timer engine
-    engine = get_engine()
-    await engine.load()
-    engine.set_fire_callback(_fire_reminder_callback)
-    engine.start_monitor()
+    timer_engine = get_timer_engine()
+    await timer_engine.load()
+    timer_engine.set_fire_callback(_fire_reminder_callback)
+    timer_engine.start_monitor()
+
+    # Add memory tools
+    memory_tools = memory_get_tools()
+    mcp_tools = memory_tools + mcp_tools
+    logger.info(f"Total tools available: {len(mcp_tools)} (including {len(memory_tools)} memory tools)")
+
+    # Start memory engine
+    memory_engine = get_memory_engine()
+    await memory_engine.load()
 
 
 async def execute_mcp_tool(tool_name: str, arguments: dict, author_id: int = 0) -> str:
@@ -286,6 +296,11 @@ async def execute_mcp_tool(tool_name: str, arguments: dict, author_id: int = 0) 
         arguments.setdefault("channel_id", 0)
         arguments["message_author_id"] = author_id
         return await execute_timer_tool(tool_name, arguments)
+
+    # Dispatch to memory engine
+    if tool_name in ("remember", "recall", "forget_memory"):
+        arguments.setdefault("channel_id", 0)
+        return await execute_memory_tool(tool_name, arguments, author_id)
 
     # Find which MCP server owns this tool
     for server_name, session in mcp_sessions.items():
@@ -592,15 +607,13 @@ async def set_min_length_command(interaction: discord.Interaction, length: int):
 
 @tree.command(name="skills", description="List all available skills")
 async def skills_command(interaction: discord.Interaction):
-    skill_list = []
-    for name, skill in skills_registry.get_all_descriptions().items():
-        if len(skill) > 1000:
-            skill = skill[:997] + "..."
-        skill_list.append(f"- `{name}`: {skill}")
     embed = discord.Embed(title="Available Skills", color=discord.Color.blue())
-    for i in range(0, len(skill_list), 10):
-        chunk = "\n".join(skill_list[i:i+10])
-        embed.add_field(name="", value=chunk, inline=False)
+    prefix = "- "
+    for name, skill in skills_registry.get_all_descriptions().items():
+        line = f"{prefix}`{name}`: {skill}"
+        if len(line) > 1000:
+            line = f"{prefix}`{name}`: {skill[:1000 - len(prefix) - len(name) - 2]}.."
+        embed.add_field(name="", value=line, inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -655,7 +668,7 @@ async def main():
 async def _start_reminder_monitor():
     """Start the timer engine's reminder monitor after a short delay."""
     await asyncio.sleep(1)
-    engine = get_engine()
+    engine = get_timer_engine()
     await engine.load()
     engine.set_fire_callback(_fire_reminder_callback)
     engine.start_monitor()
@@ -682,7 +695,7 @@ if __name__ == "__main__":
             logger.exception("Unhandled error in main loop")
     finally:
         # Cancel timer monitor so the event loop can close
-        engine = get_engine()
+        engine = get_timer_engine()
         engine.stop_monitor()
         loop.run_until_complete(client.close())
         loop.close()
