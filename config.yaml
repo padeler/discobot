@@ -9,7 +9,7 @@ history:
   max_messages: 40
 logging:
   file: bot.log
-  level: DEBUG
+  level: INFO
 mcp:
   enabled: true
   servers:
