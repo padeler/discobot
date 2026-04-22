@@ -21,7 +21,7 @@ mcp:
       command: mcp-fetch-server
       args: []
 ollama:
-  api_url: http://192.168.1.2:11434/api/chat
+  api_url: http://139.91.185.57:11434/api/chat
   model: gemma4-128k
 preprompt:
   enabled: true
