@@ -50,12 +50,16 @@ The bot receives messages and places them in a queue. A background loop runs at 
 ## Architecture
 
 ```
-Message → Queue → Loop
-                        ├── Mention → LLM → Reply (threaded)
-                        └── Auto  → Evaluator → LLM → Response
+Message → on_message → Priority Queue (mentions=0, auto=1)
+                                │
+                    Processor Loop (async task, single-threaded)
+                                ├── Mentions → LLM → Reply
+                                └── Auto  → Evaluator (with history context) → LLM → Response
 ```
 
-All messages are queued by `on_message` and processed in a periodic loop. Mentions are handled first (highest priority), followed by auto-response evaluation for non-mention messages.
+All messages are enqueued by `on_message` (fast, never blocks). A background async loop drains the queue and processes messages serially, eliminating race conditions on shared state. Mentions are processed immediately; non-mention messages are evaluated for auto-response with full conversation context.
+
+For detailed architecture, see [`MESSAGE_HANDLING.md`](MESSAGE_HANDLING.md).
 
 ## Ollama Integration
 
