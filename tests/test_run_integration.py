@@ -191,6 +191,18 @@ class TestEvaluateShouldRespond:
         assert "msg" in params or "message" in params, f"evaluate_should_respond should accept a Message object, got params: {params}"
 
 
+class TestOnMessageEnqueues:
+    """Verify that on_message only enqueues and does no LLM processing."""
+
+    def test_no_ollama_call_in_on_message(self):
+        """on_message source should not contain call_ollama — processing is delegated."""
+        import inspect
+        import run
+        source = inspect.getsource(run.on_message)
+        assert "call_ollama" not in source, "on_message should not call Ollama directly"
+        assert "process_message" not in source, "on_message should not call process_message directly"
+
+
 class TestMatchSlashCommand:
     def test_match(self):
         from engine.triggers import match_slash_command

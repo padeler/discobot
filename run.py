@@ -18,7 +18,7 @@ from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 import contextlib
 from engine import registry, triggers
-from engine.message_queue import Message
+from engine.message_queue import Message, MessageQueue
 from engine.timer_engine import get_engine as get_timer_engine, get_tools as timer_get_tools, execute_timer_tool
 from engine.memory_engine import get_engine as get_memory_engine, get_tools as memory_get_tools, execute_tool as execute_memory_tool
 load_dotenv()
@@ -31,6 +31,8 @@ mcp_tools: list[dict] = []
 # Active MCP client sessions and transports, keyed by server name
 mcp_sessions: dict[str, ClientSession] = {}
 mcp_transports: dict[str, contextlib.AsyncExitStack] = {}
+
+message_queue = MessageQueue()
 
 async def _fire_reminder_callback(reminder):
     if reminder.channel_id:
@@ -546,25 +548,38 @@ async def on_message(message):
         return
 
     guild_id = message.guild.id if message.guild else 0
-    key = f"{guild_id}_{message.channel.id}"
     active_users[message.channel.id][message.author.name] = datetime.now()
 
     if is_mention:
-        await process_message(guild_id, message.channel.id, content, message.author.name, is_mention, message.author.id)
+        await message_queue.enqueue(Message(
+            guild_id=guild_id,
+            channel_id=message.channel.id,
+            content=content,
+            author=message.author.name,
+            author_id=message.author.id,
+            is_mention=True,
+        ))
     elif config["channel"]["enabled"]:
-        if await evaluate_should_respond(guild_id, message.channel.id, content, message.author.name):
-            await process_message(guild_id, message.channel.id, content, message.author.name, False, message.author.id)
-        else:
-            history[key].append(
-                {
-                    "role": "user",
-                    "content": content,
-                    "author": message.author.name,
-                    "author_id": message.author.id,
-                    "timestamp": datetime.now().isoformat(),
-                }
-            )
-            save_history(guild_id, message.channel.id)
+        await message_queue.enqueue(Message(
+            guild_id=guild_id,
+            channel_id=message.channel.id,
+            content=content,
+            author=message.author.name,
+            author_id=message.author.id,
+            is_mention=False,
+        ))
+    else:
+        key = f"{guild_id}_{message.channel.id}"
+        history[key].append(
+            {
+                "role": "user",
+                "content": content,
+                "author": message.author.name,
+                "author_id": message.author.id,
+                "timestamp": datetime.now().isoformat(),
+            }
+        )
+        save_history(guild_id, message.channel.id)
 
 
 @tree.command(name="status", description="Show bot status")
