@@ -697,6 +697,7 @@ async def _processor_loop():
         try:
             msg = await message_queue.dequeue(asyncio.get_event_loop().time() + 0.5)
             logger.debug("Processing message from %s (mention=%s)", msg.author, msg.is_mention)
+            active_users[msg.channel_id][msg.author] = datetime.now()
 
             if msg.is_mention:
                 await process_message(msg)
