@@ -439,20 +439,33 @@ async def process_message(
 
 
 async def evaluate_should_respond(
-    guild_id: int, channel_id: int, content: str, author: str
+    msg: Message,
 ) -> bool:
-    """Decide whether the bot should auto-respond to a channel message."""
-    if len(content) < config["channel"]["min_message_length"]:
+    """Decide whether the bot should auto-respond to a channel message.
+
+    Includes recent conversation history so the LLM can evaluate context.
+    Active-user shortcut fires only if the user has recently interacted
+    with the bot (sent a message within the conversation window).
+    """
+    if len(msg.content) < config["channel"]["min_message_length"]:
         return False
 
-    recent_users = active_users.get(channel_id, {})
-    if author in recent_users:
-        last_seen = recent_users[author]
+    key = f"{msg.guild_id}_{msg.channel_id}"
+    recent_users = active_users.get(msg.channel_id, {})
+    if msg.author in recent_users:
+        last_seen = recent_users[msg.author]
         if datetime.now() - last_seen < timedelta(
             minutes=config["conversation"]["window_minutes"]
         ):
-            logger.debug("Active user %s in channel %d, responding", author, channel_id)
+            logger.debug("Active user %s in channel %d, responding", msg.author, msg.channel_id)
             return True
+
+    # Include recent history for context — last 6 messages max
+    recent_history = history.get(key, [])[-6:]
+    history_excerpt = "\n".join(
+        f'{m.get("author", "unknown")}: {m["content"]}'
+        for m in recent_history
+    )
 
     eval_prompt = [
         {"role": "system", "content": config["preprompt"]["system"]},
@@ -461,11 +474,12 @@ async def evaluate_should_respond(
             "content": f"Current date/time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         },
         {
-            "role": "user",
+            "role": "system",
             "content": (
-                f'Evaluate if the bot should respond to this message:\n\n'
-                f'"{content}"\n\n'
-                f'Respond with ONLY "YES" or "NO."'
+                f"Recent conversation context:\n{history_excerpt}\n\n"
+                f"New message from {msg.author}: \"{msg.content}\"\n\n"
+                f"Should the bot respond to this new message? "
+                f'Respond with ONLY "YES" or "NO".'
             ),
         },
     ]

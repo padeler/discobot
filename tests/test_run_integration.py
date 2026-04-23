@@ -175,6 +175,22 @@ class TestProcessMessageRefactored:
             triggers_module.match_skill = original_match
 
 
+class TestEvaluateShouldRespond:
+    def setup_method(self):
+        import run
+        run.active_skills.clear()
+        run.history.clear()
+        run.active_users.clear()
+
+    def test_evaluate_accepts_message_object(self):
+        """evaluate_should_respond should accept a Message object."""
+        import inspect
+        import run
+        sig = inspect.signature(run.evaluate_should_respond)
+        params = list(sig.parameters.keys())
+        assert "msg" in params or "message" in params, f"evaluate_should_respond should accept a Message object, got params: {params}"
+
+
 class TestMatchSlashCommand:
     def test_match(self):
         from engine.triggers import match_slash_command
