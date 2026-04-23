@@ -18,6 +18,7 @@ from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 import contextlib
 from engine import registry, triggers
+from engine.message_queue import Message
 from engine.timer_engine import get_engine as get_timer_engine, get_tools as timer_get_tools, execute_timer_tool
 from engine.memory_engine import get_engine as get_memory_engine, get_tools as memory_get_tools, execute_tool as execute_memory_tool
 load_dotenv()
@@ -135,7 +136,10 @@ def update_skills(channel_id: int, content: str, is_mention: bool) -> bool:
         if skill:
             new_skills.append({"name": skill_name, "body": skill.body})
 
+    changed = active_skills[channel_id] != new_skills
     active_skills[channel_id] = new_skills
+    if changed and new_skills:
+        logger.info("Skills updated for channel %d: %s", channel_id, [s["name"] for s in new_skills])
     return bool(matches)
 
 
@@ -383,41 +387,40 @@ async def call_ollama(messages: list[dict], author_id: int = 0) -> str:
 
 
 async def process_message(
-    guild_id: int, channel_id: int, content: str, author: str, is_mention: bool, author_id: int = 0
+    msg: Message,
 ) -> None:
-    """Process a message: update skills, append to history, call LLM, and reply."""
-    key = f"{guild_id}_{channel_id}"
+    """Process a message: update skills, append to history, call LLM, and reply.
 
-    update_skills(channel_id, content, is_mention)
+    All shared state mutations happen here — called only from the processor
+    loop which runs single-threaded, so no locking is needed.
+    """
+    key = f"{msg.guild_id}_{msg.channel_id}"
 
-    if not is_mention:
-        matched = any(m["confidence"] > 0.5 for m in triggers.match_skill(content, skills_registry, skill_threshold))
-        if matched:
-            logger.info("Active skills for %d: %s", channel_id, [s["name"] for s in active_skills.get(channel_id, [])])
+    update_skills(msg.channel_id, msg.content, msg.is_mention)
 
-    channel = client.get_channel(channel_id)
+    channel = client.get_channel(msg.channel_id)
     if not channel:
-        logger.warning("Channel %d not found", channel_id)
+        logger.warning("Channel %d not found", msg.channel_id)
         return
 
-    cleanup_history(guild_id, channel_id)
+    cleanup_history(msg.guild_id, msg.channel_id)
 
     history[key].append(
         {
             "role": "user",
-            "content": content,
-            "author": author,
-            "author_id": author_id,
-            "timestamp": datetime.now().isoformat(),
+            "content": msg.content,
+            "author": msg.author,
+            "author_id": msg.author_id,
+            "timestamp": msg.timestamp.isoformat(),
         }
     )
 
-    prompt = build_prompt(channel_id, history[key], author_id)
+    prompt = build_prompt(msg.channel_id, history[key], msg.author_id)
     logger.debug("Prompt: %s", prompt)
 
     try:
         async with channel.typing():
-            response = await call_ollama(prompt, author_id)
+            response = await call_ollama(prompt, msg.author_id)
             logger.info("Response: %s", response)
 
         history[key].append(
@@ -428,7 +431,7 @@ async def process_message(
                 "timestamp": datetime.now().isoformat(),
             }
         )
-        save_history(guild_id, channel_id)
+        save_history(msg.guild_id, msg.channel_id)
 
         await channel.send(response)
     except Exception as e:

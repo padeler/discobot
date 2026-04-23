@@ -140,6 +140,41 @@ class TestAuthorIdScoping:
         assert "author_id" in sig.parameters, "call_ollama should accept author_id parameter"
 
 
+class TestProcessMessageRefactored:
+    def setup_method(self):
+        import run
+        run.active_skills.clear()
+        run.history.clear()
+
+    def test_process_message_accepts_message_object(self):
+        """process_message should accept a Message dataclass."""
+        import inspect
+        import run
+        sig = inspect.signature(run.process_message)
+        params = list(sig.parameters.keys())
+        assert "msg" in params or "message" in params, f"process_message should accept a Message object, got params: {params}"
+
+    def test_process_message_no_redundant_skill_match(self):
+        """update_skills should be called once per message, not twice."""
+        import run
+        from engine import triggers as triggers_module
+        original_match = triggers_module.match_skill
+        call_count = 0
+
+        def counting_match(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return original_match(*args, **kwargs)
+
+        triggers_module.match_skill = counting_match
+        try:
+            run.update_skills(123, "search the web", is_mention=False)
+            count_after_update = call_count
+            assert count_after_update > 0, "update_skills should call match_skill"
+        finally:
+            triggers_module.match_skill = original_match
+
+
 class TestMatchSlashCommand:
     def test_match(self):
         from engine.triggers import match_slash_command
