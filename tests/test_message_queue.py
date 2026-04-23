@@ -86,7 +86,23 @@ class TestMessageQueue:
     @pytest.mark.asyncio
     async def test_max_queue_size(self):
         q = MessageQueue(max_size=2)
-        await q.enqueue(Message(1, 2, "a", "u", 1))
-        await q.enqueue(Message(1, 2, "b", "u", 1))
-        await q.enqueue(Message(1, 2, "c", "u", 1))
+        await q.enqueue(Message(1, 2, "a", "u", 1, is_mention=True))
+        await q.enqueue(Message(1, 2, "b", "u", 1, is_mention=False))
+        # Third enqueue should drop the auto-response (priority 1), not the mention
+        await q.enqueue(Message(1, 2, "c", "u", 1, is_mention=False))
+        assert q.size() == 2
+        # The mention should survive
+        first = await q.dequeue(asyncio.get_event_loop().time() + 0.1)
+        assert first.is_mention is True
+
+    @pytest.mark.asyncio
+    async def test_max_queue_size_all_same_priority(self):
+        import time
+        q = MessageQueue(max_size=2)
+        await q.enqueue(Message(1, 2, "a", "u", 1, is_mention=False))
+        time.sleep(0.01)
+        await q.enqueue(Message(1, 2, "b", "u", 1, is_mention=False))
+        time.sleep(0.01)
+        # Third enqueue should drop the oldest
+        await q.enqueue(Message(1, 2, "c", "u", 1, is_mention=False))
         assert q.size() == 2
