@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import signal
+import traceback
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -685,10 +686,47 @@ async def set_preprompt_command(interaction: discord.Interaction, preprompt: str
     )
 
 
+async def _processor_loop():
+    """Background loop that drains the message queue and processes messages.
+
+    Runs single-threaded in the asyncio event loop, so access to shared state
+    (history, active_skills, active_users) is naturally serialized.
+    """
+    logger.info("Processor loop started")
+    while True:
+        try:
+            msg = await message_queue.dequeue(asyncio.get_event_loop().time() + 0.5)
+            logger.debug("Processing message from %s (mention=%s)", msg.author, msg.is_mention)
+
+            if msg.is_mention:
+                await process_message(msg)
+            else:
+                if await evaluate_should_respond(msg):
+                    await process_message(msg)
+                else:
+                    key = f"{msg.guild_id}_{msg.channel_id}"
+                    history[key].append(
+                        {
+                            "role": "user",
+                            "content": msg.content,
+                            "author": msg.author,
+                            "author_id": msg.author_id,
+                            "timestamp": msg.timestamp.isoformat(),
+                        }
+                    )
+                    save_history(msg.guild_id, msg.channel_id)
+                    logger.debug("Auto-response skipped for message from %s", msg.author)
+        except asyncio.TimeoutError:
+            continue
+        except Exception:
+            logger.error("Processor loop error:\n%s", traceback.format_exc())
+
+
 async def main():
-    """Start the bot: initialize MCP, start reminder monitor, and connect to Discord."""
+    """Start the bot: initialize MCP, start reminder monitor, start processor, connect to Discord."""
     await setup_mcp()
     asyncio.create_task(_start_reminder_monitor())
+    asyncio.create_task(_processor_loop())
     await client.start(DISCORD_TOKEN)
 
 

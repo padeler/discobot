@@ -203,6 +203,22 @@ class TestOnMessageEnqueues:
         assert "process_message" not in source, "on_message should not call process_message directly"
 
 
+class TestProcessorLoop:
+    """Verify the processor loop exists and is wired up."""
+
+    def test_processor_loop_exists(self):
+        """run module should have a _processor_loop coroutine."""
+        import run
+        assert hasattr(run, '_processor_loop'), "run module should define _processor_loop"
+
+    def test_main_starts_processor(self):
+        """main() should start the processor loop as a background task."""
+        import inspect
+        import run
+        source = inspect.getsource(run.main)
+        assert '_processor_loop' in source, "main() should start the processor loop"
+
+
 class TestMatchSlashCommand:
     def test_match(self):
         from engine.triggers import match_slash_command
