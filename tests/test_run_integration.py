@@ -131,6 +131,15 @@ class TestSkillsCommandTruncation:
         assert line == original
 
 
+class TestAuthorIdScoping:
+    def test_call_ollama_accepts_author_id(self):
+        """Verify call_ollama signature includes author_id parameter."""
+        import inspect
+        import run
+        sig = inspect.signature(run.call_ollama)
+        assert "author_id" in sig.parameters, "call_ollama should accept author_id parameter"
+
+
 class TestMatchSlashCommand:
     def test_match(self):
         from engine.triggers import match_slash_command

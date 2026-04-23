@@ -31,9 +31,6 @@ mcp_tools: list[dict] = []
 mcp_sessions: dict[str, ClientSession] = {}
 mcp_transports: dict[str, contextlib.AsyncExitStack] = {}
 
-# Context for the current message being processed
-_current_author_id: int = 0
-
 async def _fire_reminder_callback(reminder):
     if reminder.channel_id:
         channel = client.get_channel(reminder.channel_id)
@@ -324,7 +321,7 @@ async def execute_mcp_tool(tool_name: str, arguments: dict, author_id: int = 0) 
 
     return f"Error: tool '{tool_name}' not found on any MCP server"
 
-async def call_ollama(messages: list[dict]) -> str:
+async def call_ollama(messages: list[dict], author_id: int = 0) -> str:
     """Call the Ollama API with tool calling support, handling multi-turn tool use."""
     url = config["ollama"]["api_url"]
     payload = {
@@ -362,7 +359,7 @@ async def call_ollama(messages: list[dict]) -> str:
                     args = args_str
 
                 logger.info(f"Tool call: {name}({json.dumps(args)})")
-                tool_result = await execute_mcp_tool(name, args, _current_author_id)
+                tool_result = await execute_mcp_tool(name, args, author_id)
                 logger.debug(f"Tool result: {tool_result[:200]}")
 
                 # Add tool call + result to messages
@@ -419,10 +416,8 @@ async def process_message(
     logger.debug("Prompt: %s", prompt)
 
     try:
-        global _current_author_id
-        _current_author_id = author_id
         async with channel.typing():
-            response = await call_ollama(prompt)
+            response = await call_ollama(prompt, author_id)
             logger.info("Response: %s", response)
 
         history[key].append(
@@ -473,7 +468,7 @@ async def evaluate_should_respond(
     ]
 
     try:
-        result = await call_ollama(eval_prompt)
+        result = await call_ollama(eval_prompt, 0)
         should_respond = result.strip().upper().startswith("YES")
         logger.debug("Auto-response evaluation: %s", should_respond)
         return should_respond
