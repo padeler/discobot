@@ -400,6 +400,12 @@ async def process_message(
     key = f"{msg.guild_id}_{msg.channel_id}"
 
     update_skills(msg.channel_id, msg.content, msg.is_mention)
+    current_skills = [s["name"] for s in active_skills.get(msg.channel_id, [])]
+    logger.info(
+        "Processing message from %s — active skills: %s",
+        msg.author,
+        current_skills if current_skills else "none",
+    )
 
     channel = client.get_channel(msg.channel_id)
     if not channel:
@@ -422,9 +428,10 @@ async def process_message(
     logger.debug("Prompt: %s", prompt)
 
     try:
+        logger.info("Calling LLM for message from %s", msg.author)
         async with channel.typing():
             response = await call_ollama(prompt, msg.author_id)
-            logger.info("Response: %s", response)
+        logger.info("LLM response for %s: %s", msg.author, response[:120])
 
         history[key].append(
             {
@@ -436,6 +443,7 @@ async def process_message(
         )
         save_history(msg.guild_id, msg.channel_id)
 
+        logger.info("Sending reply to %s in channel %d", msg.author, msg.channel_id)
         await channel.send(response)
     except Exception as e:
         logger.error("Error processing message: %s", e)
@@ -451,17 +459,15 @@ async def evaluate_should_respond(
     with the bot (sent a message within the conversation window).
     """
     if len(msg.content) < config["channel"]["min_message_length"]:
+        logger.info(
+            "Eval %s: message too short (%d < %d), will not respond",
+            msg.author,
+            len(msg.content),
+            config["channel"]["min_message_length"],
+        )
         return False
 
     key = f"{msg.guild_id}_{msg.channel_id}"
-    recent_users = active_users.get(msg.channel_id, {})
-    if msg.author in recent_users:
-        last_seen = recent_users[msg.author]
-        if datetime.now() - last_seen < timedelta(
-            minutes=config["conversation"]["window_minutes"]
-        ):
-            logger.debug("Active user %s in channel %d, responding", msg.author, msg.channel_id)
-            return True
 
     # Include recent history for context — last 6 messages max
     recent_history = history.get(key, [])[-6:]
@@ -488,9 +494,15 @@ async def evaluate_should_respond(
     ]
 
     try:
+        logger.info("Eval %s: asking LLM whether to respond", msg.author)
         result = await call_ollama(eval_prompt, 0)
         should_respond = result.strip().upper().startswith("YES")
-        logger.debug("Auto-response evaluation: %s", should_respond)
+        logger.info(
+            "Eval %s: LLM decision = %s, will respond = %s",
+            msg.author,
+            result.strip()[:80],
+            should_respond,
+        )
         return should_respond
     except Exception as e:
         logger.error("Error evaluating response: %s", e)
@@ -552,6 +564,12 @@ async def on_message(message):
     active_users[message.channel.id][message.author.name] = datetime.now()
 
     if is_mention:
+        logger.info(
+            "Received mention from %s in channel %d: %r",
+            message.author.name,
+            message.channel.id,
+            content,
+        )
         await message_queue.enqueue(Message(
             guild_id=guild_id,
             channel_id=message.channel.id,
@@ -561,6 +579,12 @@ async def on_message(message):
             is_mention=True,
         ))
     elif config["channel"]["enabled"]:
+        logger.info(
+            "Received channel message from %s in channel %d: %r",
+            message.author.name,
+            message.channel.id,
+            content,
+        )
         await message_queue.enqueue(Message(
             guild_id=guild_id,
             channel_id=message.channel.id,
@@ -696,7 +720,12 @@ async def _processor_loop():
     while True:
         try:
             msg = await message_queue.dequeue(asyncio.get_event_loop().time() + 0.5)
-            logger.debug("Processing message from %s (mention=%s)", msg.author, msg.is_mention)
+            logger.info(
+                "Dequeued message from %s in channel %d (mention=%s)",
+                msg.author,
+                msg.channel_id,
+                msg.is_mention,
+            )
             active_users[msg.channel_id][msg.author] = datetime.now()
 
             if msg.is_mention:
@@ -705,6 +734,10 @@ async def _processor_loop():
                 if await evaluate_should_respond(msg):
                     await process_message(msg)
                 else:
+                    logger.info(
+                        "Eval %s: decided NOT to respond, storing in history only",
+                        msg.author,
+                    )
                     key = f"{msg.guild_id}_{msg.channel_id}"
                     history[key].append(
                         {
@@ -716,7 +749,6 @@ async def _processor_loop():
                         }
                     )
                     save_history(msg.guild_id, msg.channel_id)
-                    logger.debug("Auto-response skipped for message from %s", msg.author)
         except asyncio.TimeoutError:
             continue
         except Exception:
