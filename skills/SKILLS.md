@@ -8,6 +8,8 @@
 - **general**: Default skill for general conversation, answering questions, providing help, casual chat, advice, suggestions, and any topic the user brings up. Keywords: chat, question, help, advice, how to, what is, tell me, explain.
 
 
+- **memory**: Use when the user asks you to remember something, recall stored information, list memories, forget/delete a memory, or retrieve facts you've stored. Keywords: remember, recall, memory, know, forgot, forget, delete memory, what do you remember, list memories, stored info.
+
 - **timer-reminder**: Use when the user asks to set a reminder, create a timer, schedule a notification, or wake them up later. Also use for listing, canceling, or managing pending reminders. Keywords: remind, timer, alert, notification, wake, later, when, cancel reminder, list reminders, schedule, timer.
 
 
